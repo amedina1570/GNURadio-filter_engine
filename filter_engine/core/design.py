@@ -92,6 +92,19 @@ class FilterDesign:
     #: Human-readable notes about estimation and any adjustments made.
     notes: list[str] = field(default_factory=list)
 
+    #: IIR only: the *prototype* order handed to :func:`scipy.signal.iirfilter`.
+    #: This is not :attr:`order` -- a bandpass or bandstop doubles the
+    #: prototype, so an order-6 prototype yields an order-12 filter. Code
+    #: generation must pass the prototype back or it designs a different
+    #: filter.
+    prototype_order: int | None = None
+    #: IIR only: the critical frequencies actually used, in Hz. The ``*ord``
+    #: helpers return a natural frequency that is generally *not* the
+    #: requested passband edge (Butterworth places it between the passband and
+    #: stopband edges), so the realised value is recorded rather than
+    #: re-derived.
+    critical_freqs: float | list[float] | None = None
+
     @property
     def is_fir(self) -> bool:
         return self.sos is None
@@ -558,7 +571,17 @@ def _design_iir(spec: FilterSpec) -> FilterDesign:
         )
 
     design_obj = FilterDesign(
-        spec=spec, b=np.asarray(b), a=np.asarray(a), sos=sos, notes=notes
+        spec=spec,
+        b=np.asarray(b),
+        a=np.asarray(a),
+        sos=sos,
+        notes=notes,
+        prototype_order=int(order),
+        critical_freqs=(
+            [float(v) for v in np.atleast_1d(wn)]
+            if np.ndim(wn) > 0
+            else float(wn)
+        ),
     )
     if not design_obj.is_stable:
         notes.append(
