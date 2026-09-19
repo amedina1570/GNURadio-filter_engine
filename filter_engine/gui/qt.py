@@ -5,12 +5,14 @@ module means the rest of the GUI never names a binding, and matplotlib is
 told which one to use before it picks for itself -- get that order wrong and
 it can load a second, different binding into the same process.
 
-Set ``FILTER_ENGINE_QT_API`` to force a choice.
+Set ``FILTER_ENGINE_QT_API`` to force a choice. Otherwise an existing Qt
+binding or matplotlib's ``QT_API`` setting is used.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 
 __all__ = [
     "QT_API",
@@ -28,14 +30,29 @@ __all__ = [
 def _load():
     """Import a Qt binding and return the pieces the GUI needs."""
     forced = os.environ.get("FILTER_ENGINE_QT_API", "").lower()
+    requested = forced or os.environ.get("QT_API", "").lower()
     candidates = ["pyside6", "pyqt6"]
-    if forced:
-        if forced not in candidates:
+    loaded = [
+        api
+        for api, module in (("pyside6", "PySide6.QtCore"), ("pyqt6", "PyQt6.QtCore"))
+        if module in sys.modules
+    ]
+    if len(loaded) > 1:
+        raise ImportError("Both PySide6 and PyQt6 are already loaded; use one Qt binding.")
+    if requested:
+        if requested not in candidates:
             raise ImportError(
-                f"FILTER_ENGINE_QT_API={forced!r} is not supported; "
+                f"Qt binding {requested!r} is not supported; "
                 f"choose one of {candidates}"
             )
-        candidates = [forced]
+        if loaded and loaded[0] != requested:
+            raise ImportError(
+                f"{loaded[0]} is already loaded, but {requested} was requested. "
+                "Use the same Qt binding throughout the process."
+            )
+        candidates = [requested]
+    elif loaded:
+        candidates = loaded
 
     errors: list[str] = []
     for api in candidates:

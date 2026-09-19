@@ -15,6 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy import fft
 from scipy import signal
 
 from .design import FilterDesign, _quiet_bad_coefficients
@@ -470,9 +471,9 @@ def compressed_response(
             spec.chirp_bandwidth_hz,
             spec.down_chirp,
         )
-        out = np.convolve(taps, reference)
+        out = signal.convolve(taps, reference, method="auto")
     else:
-        out = np.convolve(taps, np.conj(taps[::-1]))
+        out = signal.convolve(taps, np.conj(taps[::-1]), method="auto")
 
     rate = spec.sample_rate
     if oversample > 1 and out.size > 1:
@@ -663,7 +664,7 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
     tx = lfm_transmit_pulse(
         spec.sample_rate, spec.pulse_width_s, spec.chirp_bandwidth_hz, spec.down_chirp
     )
-    plain = np.convolve(unweighted, tx)
+    plain = signal.convolve(unweighted, tx, method="auto")
     if oversample > 1:
         plain = _interpolate(plain, oversample)
     plain = np.abs(plain)
@@ -711,7 +712,7 @@ def mti_velocity_response(
     velocity: it shows the clutter notch at zero and the blind speeds where
     legitimate targets vanish along with the clutter.
     """
-    from .radar import doppler_hz, velocity_ms
+    from .radar import velocity_ms, wavelength_m
 
     spec = fd.spec
     prf = spec.sample_rate
@@ -723,12 +724,8 @@ def mti_velocity_response(
     taps = np.asarray(fd.b)[::-1]
     # Evaluating past Nyquist is deliberate here: that wrap-around is exactly
     # what produces blind speeds, so it must show on the plot.
-    z = np.exp(
-        -2j
-        * np.pi
-        * np.array([doppler_hz(v, spec.radar_carrier_hz) for v in velocities])
-        / prf
-    )
+    shifts = 2.0 * velocities / wavelength_m(spec.radar_carrier_hz)
+    z = np.exp(-2j * np.pi * shifts / prf)
     h = np.polyval(taps, z)
     return velocities, db20(h)
 
@@ -771,15 +768,23 @@ def ambiguity_function(
     dopplers = np.linspace(-max_doppler_hz, max_doppler_hz, num_doppler)
     t = np.arange(reference.size) / spec.sample_rate
 
-    rows = []
-    for shift in dopplers:
-        rows.append(
-            np.abs(np.convolve(taps, reference * np.exp(2j * np.pi * shift * t)))[
-                ::delay_decimation
-            ]
-        )
+    # The same taps are used for every Doppler row. For long pulses, transform
+    # them once instead of repeating that work for every convolution. Keep the
+    # direct method for short pulses, where FFT setup costs more than it saves.
+    full_length = taps.size + reference.size - 1
+    grid = np.empty((num_doppler, len(range(0, full_length, delay_decimation))))
+    use_fft = signal.choose_conv_method(taps, reference, mode="full") == "fft"
+    if use_fft:
+        fft_length = fft.next_fast_len(full_length)
+        taps_fft = fft.fft(taps, fft_length)
 
-    grid = np.asarray(rows)
+    for row, shift in enumerate(dopplers):
+        shifted = reference * np.exp(2j * np.pi * shift * t)
+        if use_fft:
+            response = fft.ifft(taps_fft * fft.fft(shifted, fft_length))[:full_length]
+        else:
+            response = np.convolve(taps, shifted)
+        grid[row] = np.abs(response[::delay_decimation])
     peak = float(np.max(grid))
     if peak > 0:
         grid = grid / peak

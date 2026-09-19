@@ -486,9 +486,9 @@ class PulsePanel(QtWidgets.QWidget):
         # Both spectra share the input's peak as the reference, so the plot
         # shows how far the filter pushed each component down rather than
         # renormalising the output back to the top of the axis.
-        _f, mag_in_lin = signals.spectrum(self._generated.x, fs, window, db=False)
+        f_in, mag_in_lin = signals.spectrum(self._generated.x, fs, window, db=False)
         ref = float(np.max(mag_in_lin)) or 1.0
-        f_in, m_in = signals.spectrum(self._generated.x, fs, window, db=True, ref=ref)
+        m_in = 20.0 * np.log10(np.maximum(mag_in_lin / ref, 1e-12))
         f_out, m_out = signals.spectrum(self._output, fs, window, db=True, ref=ref)
         plotting.plot_pulse_spectrum(figure, f_in, m_in, f_out, m_out, self._design)
 

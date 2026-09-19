@@ -50,6 +50,18 @@ def test_window_starts_with_a_valid_design(window):
     assert "taps" in window.summary_label.text()
 
 
+def test_qt_loader_respects_an_existing_binding(monkeypatch):
+    from filter_engine.gui.qt import _load
+
+    monkeypatch.delenv("FILTER_ENGINE_QT_API", raising=False)
+    monkeypatch.setenv("QT_API", "pyqt6")
+    with pytest.raises(ImportError, match="already loaded"):
+        _load()
+
+    monkeypatch.setenv("QT_API", "pyside6")
+    assert _load()[0] == "pyside6"
+
+
 def test_every_plot_draws(window):
     for label, canvas in window.canvases.items():
         canvas.refresh(force=True)

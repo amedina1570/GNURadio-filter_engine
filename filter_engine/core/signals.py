@@ -538,8 +538,20 @@ def apply_filter(fd: FilterDesign, x: np.ndarray) -> np.ndarray:
     equivalent to filtering I and Q separately.
     """
     x = np.asarray(x)
+    if x.size == 0:
+        return np.empty_like(x, dtype=np.result_type(x, fd.b, fd.a))
     if fd.sos is not None:
         return sig.sosfilt(fd.sos, x)
+    if (
+        x.ndim == 1
+        and fd.a.size == 1
+        and fd.a[0] == 1
+        and sig.choose_conv_method(x, fd.b, mode="full") == "fft"
+    ):
+        # Overlap-add avoids the quadratic cost of a long FIR on a long record
+        # without building one huge FFT of the entire input. The prefix is the
+        # causal, zero-initial-state output returned by lfilter.
+        return sig.oaconvolve(x, fd.b, mode="full")[:x.size]
     return sig.lfilter(fd.b, fd.a, x)
 
 

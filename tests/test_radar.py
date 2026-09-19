@@ -284,6 +284,35 @@ def test_ambiguity_surface_peaks_at_the_origin():
     assert abs(delays[col]) <= 4 / FS * 2
 
 
+@pytest.mark.parametrize("num_taps", [101, 5001])
+def test_ambiguity_surface_matches_direct_convolution(num_taps):
+    """Both the short-pulse and FFT paths preserve the sampled response."""
+    spec = FilterSpec(
+        response=Response.MATCHED_LFM,
+        sample_rate=1e6,
+        pulse_width_s=num_taps / 1e6,
+        chirp_bandwidth_hz=400e3,
+        pri_s=(num_taps + 1) / 1e6,
+        window="boxcar",
+    )
+    fd = design(spec)
+    delays, dopplers, grid_db = analysis.ambiguity_function(
+        fd, num_doppler=5, max_doppler_hz=50e3, delay_decimation=3
+    )
+    reference = radar.lfm_transmit_pulse(
+        spec.sample_rate, spec.pulse_width_s, spec.chirp_bandwidth_hz
+    )
+    t = np.arange(reference.size) / spec.sample_rate
+    expected = np.array([
+        np.abs(np.convolve(fd.b, reference * np.exp(2j * np.pi * shift * t))[::3])
+        for shift in dopplers
+    ])
+    expected /= expected.max()
+
+    np.testing.assert_allclose(10 ** (grid_db / 20), expected, atol=1e-10)
+    assert delays.size == grid_db.shape[1]
+
+
 # --------------------------------------------------------------------------
 # MTI
 # --------------------------------------------------------------------------

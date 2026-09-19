@@ -31,8 +31,9 @@ filter-engine
 ```
 
 Requires Python 3.10+. The GUI runs on PySide6 (default) or PyQt6; set
-`FILTER_ENGINE_QT_API=pyqt6` to force the latter. Everything except the GUI
-works with no Qt binding at all.
+`FILTER_ENGINE_QT_API=pyqt6` to force the latter. When embedding the GUI, an
+already loaded Qt binding or matplotlib's `QT_API` setting is respected.
+Everything except the GUI works with no Qt binding at all.
 
 ---
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy import signal
 
 from filter_engine.core import analysis, firdes, signals
 from filter_engine.core.design import DesignError, design
@@ -354,6 +355,24 @@ def test_every_excitation_generates_and_filters(kind):
     y = signals.apply_filter(fd, generated.x)
     assert y.size == generated.x.size
     assert np.all(np.isfinite(y))
+
+
+@pytest.mark.parametrize("complex_input", [False, True])
+def test_long_fir_matches_causal_lfilter(complex_input):
+    fd = design(FilterSpec(auto_order=False, num_taps=801))
+    rng = np.random.default_rng(17)
+    x = rng.standard_normal(20_000)
+    if complex_input:
+        x = x + 1j * rng.standard_normal(x.size)
+
+    expected = signal.lfilter(fd.b, fd.a, x)
+    actual = signals.apply_filter(fd, x)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
+
+
+def test_filter_accepts_an_empty_record():
+    fd = design(FilterSpec())
+    assert signals.apply_filter(fd, np.empty(0)).shape == (0,)
 
 
 def test_a_carrier_offset_produces_complex_baseband_at_that_frequency():
