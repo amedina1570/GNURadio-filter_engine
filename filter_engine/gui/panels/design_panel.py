@@ -217,7 +217,9 @@ class DesignPanel(QtWidgets.QWidget):
         self.atten_spin.setDecimals(1)
         self.atten_spin.setSingleStep(5.0)
         self.atten_spin.setSuffix(" dB")
-        self.atten_spin.valueChanged.connect(self._emit)
+        # Not just _emit: a derived Kaiser beta is a function of this value,
+        # so the displayed beta has to follow it.
+        self.atten_spin.valueChanged.connect(self._on_stopband)
         self.atten_row = LabelledRow(form, "Stopband attenuation", self.atten_spin)
 
         self.gain_spin = QtWidgets.QDoubleSpinBox()
@@ -447,6 +449,10 @@ class DesignPanel(QtWidgets.QWidget):
         self._update_visibility()
         self._emit()
 
+    def _on_stopband(self, _value: float = 0.0) -> None:
+        self._update_visibility()
+        self._emit()
+
     # ----------------------------------------------------------- presentation
     def _update_labels(self) -> None:
         from ..widgets.fields import format_frequency
@@ -469,6 +475,27 @@ class DesignPanel(QtWidgets.QWidget):
             message = SDR_PLATFORMS[name].check_sample_rate(fs)
             self.platform_warning.setText(message or "")
             self.platform_warning.setVisible(bool(message))
+
+    def _sync_kaiser_beta(self, auto: bool) -> None:
+        """Show the beta the design will really use, and lock it when derived."""
+        from ...core.firdes import kaiser_beta_for_atten
+
+        self.beta_spin.setEnabled(not auto)
+        if auto:
+            derived = kaiser_beta_for_atten(self.atten_spin.value())
+            blocked = self.beta_spin.blockSignals(True)
+            self.beta_spin.setValue(derived)
+            self.beta_spin.blockSignals(blocked)
+            self.beta_row.label.setText("Kaiser beta (derived)")
+            self.beta_spin.setToolTip(
+                f"Derived from the {self.atten_spin.value():.1f} dB stopband "
+                "requirement. Turn off order estimation to set it yourself."
+            )
+        else:
+            self.beta_row.label.setText("Kaiser beta")
+            self.beta_spin.setToolTip(
+                "Higher beta means a deeper stopband and a wider transition."
+            )
 
     def _update_visibility(self) -> None:
         response = self._response()
@@ -513,10 +540,16 @@ class DesignPanel(QtWidgets.QWidget):
             and response is not Response.DIFFERENTIATOR
         )
         self.window_row.setVisible(windowed or response is Response.HILBERT)
+        is_kaiser = str(self.window_combo.currentData()) == "kaiser"
         self.beta_row.setVisible(
-            (windowed or response is Response.HILBERT)
-            and str(self.window_combo.currentData()) == "kaiser"
+            (windowed or response is Response.HILBERT) and is_kaiser
         )
+        # With auto order on, beta is derived from the stopband requirement and
+        # whatever is in this box is ignored. Showing an editable 8.6 that has
+        # no effect is worse than showing nothing, so display the value that is
+        # actually used and lock the field.
+        if is_kaiser and windowed:
+            self._sync_kaiser_beta(auto)
         self.method_combo.setEnabled(not is_pulse and response is not Response.HILBERT)
 
         # Order
