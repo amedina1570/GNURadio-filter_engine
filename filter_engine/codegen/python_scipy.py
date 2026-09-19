@@ -8,8 +8,6 @@ the stored taps.
 
 from __future__ import annotations
 
-import numpy as np
-
 from ..core.design import FilterDesign
 from ..core.spec import FilterFamily, FirMethod, Response
 from ._common import format_floats, spec_comment
@@ -235,18 +233,16 @@ def _redesign_call(fd: FilterDesign) -> list[str] | None:
             "return sos",
         ]
 
-    half = s.transition_width / 2.0
-
     if s.response is Response.HILBERT:
         return [
-            f"return signal.remez(",
+            "return signal.remez(",
             f"    {fd.num_taps}, [{s.f_low!r}, {s.f_high!r}], [{s.gain!r}],",
             f'    type="hilbert", fs={fs!r},',
             ")",
         ]
     if s.response is Response.DIFFERENTIATOR:
         return [
-            f"return signal.remez(",
+            "return signal.remez(",
             f"    {fd.num_taps}, [0.0, {s.f_high!r}], [{s.gain / fs!r}],",
             f'    type="differentiator", fs={fs!r},',
             ")",

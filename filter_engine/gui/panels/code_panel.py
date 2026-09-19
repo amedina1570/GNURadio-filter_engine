@@ -12,7 +12,7 @@ import re
 from ... import codegen
 from ...core.design import FilterDesign
 from ...core.quantize import QuantizedFilter
-from ..qt import Qt, QtGui, QtWidgets
+from ..qt import QtGui, QtWidgets
 
 __all__ = ["CodePanel"]
 

@@ -303,7 +303,7 @@ def _demo_block(fd: FilterDesign, name: str, complex_io: bool) -> list[str]:
             ]
         )
     else:
-        lines.append(f'    print(f"{{len(SECTIONS)}} biquad sections")')
+        lines.append('    print(f"{len(SECTIONS)} biquad sections")')
     lines.extend(
         [
             f"    block = {name}()",

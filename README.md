@@ -103,6 +103,12 @@ recomputes them. Run the file directly and it checks one against the other.
 **109 tests do exactly that**, across every design path, by executing the
 generated module as a subprocess.
 
+The HDL is not compiled by the test suite — no simulator is assumed — but the
+arithmetic it encodes is. A bit-exact Python model of the emitted transposed
+datapath (same rounding, same saturation) is held against the filter it
+implements, and the `.coe`/`.mif` files are decoded back to integers and
+compared. **Synthesise and simulate the RTL before trusting it in hardware.**
+
 ---
 
 ## Using it as a library
@@ -185,8 +191,11 @@ synthesis.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # everything
-pytest tests/test_core.py    # DSP properties only, fast
+pytest                          # everything (~4 min; the round-trip tests
+                                # spawn a subprocess per case)
+pytest tests/test_core.py       # DSP properties only, ~7 s
+pytest tests/test_hdl.py        # fixed-point datapath and coefficient files
+pytest tests/test_gui_smoke.py  # headless GUI
 ```
 
 The GUI tests run under Qt's `offscreen` platform and need no display.

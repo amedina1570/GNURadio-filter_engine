@@ -20,7 +20,7 @@ import math
 import numpy as np
 
 from ..core.quantize import QuantizedFilter
-from ._common import format_ints, spec_comment, timestamp
+from ._common import spec_comment
 
 __all__ = ["generate_coe", "generate_mif", "generate_verilog", "generate_vhdl"]
 
@@ -86,7 +86,7 @@ def generate_coe(q: QuantizedFilter, radix: int = 10) -> str:
             f"; Quantization error floor: {q.error_floor_db:.1f} dB.",
             ";",
             f"radix = {radix};",
-            f"coefdata =",
+            "coefdata =",
             f" {body};",
             "",
         ]
@@ -198,8 +198,16 @@ def generate_verilog(
             "    // Rescale to the input word width: shift the binary point back",
             "    // by COEF_FRAC, rounding to nearest rather than truncating so",
             "    // the filter does not acquire a DC offset.",
-            "    wire signed [ACC_W-1:0] rounded =",
-            "        (acc[0] + (1 <<< (COEF_FRAC-1))) >>> COEF_FRAC;",
+            "    //",
+            "    // ROUND_ADD is built at the accumulator's width on purpose. A",
+            "    // bare `1 <<< (COEF_FRAC-1)` is a 32-bit signed literal, which",
+            "    // overflows to negative at COEF_FRAC = 32 and silently turns",
+            "    // rounding into a large subtraction.",
+            "    localparam signed [ACC_W-1:0] ROUND_ADD = (COEF_FRAC == 0)",
+            "        ? {ACC_W{1'b0}}",
+            "        : ({{(ACC_W-1){1'b0}}, 1'b1} <<< (COEF_FRAC - 1));",
+            "",
+            "    wire signed [ACC_W-1:0] rounded = (acc[0] + ROUND_ADD) >>> COEF_FRAC;",
             "",
             "    // Saturate instead of wrapping: a wrapped overflow turns a loud",
             "    // sample into a full-scale sample of the opposite sign, which",
@@ -338,7 +346,7 @@ def generate_vhdl(
             f"    constant ACC_W     : integer := {acc_w};",
             f"    constant COEF_FRAC : integer := {q.fmt.frac_bits};",
             "    type coef_array is array (natural range <>) of integer;",
-            f"    constant COEFFS : coef_array(0 to NTAPS-1) := (",
+            "    constant COEFFS : coef_array(0 to NTAPS-1) := (",
             f"        {table}",
             "    );",
             f"end package {name}_pkg;",
