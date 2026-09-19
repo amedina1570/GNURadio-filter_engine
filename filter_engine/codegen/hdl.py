@@ -44,27 +44,48 @@ def _twos_complement_hex(value: int, width: int) -> str:
     return format(int(value) & ((1 << width) - 1), f"0{digits}X")
 
 
-def _require_fir(q: QuantizedFilter, what: str) -> np.ndarray:
+def _require_fir(
+    q: QuantizedFilter, what: str, component: str | None = None
+) -> np.ndarray:
+    """Integer taps for a coefficient file, choosing an I/Q component.
+
+    A complex filter has two coefficient sets. ``component`` picks one; with
+    ``None`` they are concatenated, in-phase first, which is what the Vivado
+    FIR Compiler expects when told there are two coefficient sets.
+    """
     if q.int_sos is not None:
         raise ValueError(
             f"{what} describes a single FIR tap set, but this is an IIR "
             "design. Export the biquad coefficients with the Verilog or VHDL "
             "generator, which emits the cascade."
         )
-    return np.asarray(q.int_taps, dtype=np.int64)
+    if not q.is_complex:
+        return np.asarray(q.int_taps, dtype=np.int64)
+
+    if component == "i":
+        return q.int_taps_i
+    if component == "q":
+        return q.int_taps_q
+    if component is None:
+        return np.concatenate([q.int_taps_i, q.int_taps_q])
+    raise ValueError(f"component must be 'i', 'q' or None, not {component!r}")
 
 
 # --------------------------------------------------------------------------
 # Vivado coefficient files
 # --------------------------------------------------------------------------
-def generate_coe(q: QuantizedFilter, radix: int = 10) -> str:
+def generate_coe(
+    q: QuantizedFilter, radix: int = 10, component: str | None = None
+) -> str:
     """Xilinx ``.coe`` file for the Vivado FIR Compiler.
 
     The FIR Compiler takes *integer* coefficients and applies the binary
     point itself, so the ``Q`` format is recorded in the header comment for
     whoever sets that up.
+
+    A complex filter writes both coefficient sets, in-phase first.
     """
-    taps = _require_fir(q, "A .coe file")
+    taps = _require_fir(q, "A .coe file", component)
     if radix not in (2, 10, 16):
         raise ValueError("radix must be 2, 10 or 16")
 
@@ -84,6 +105,7 @@ def generate_coe(q: QuantizedFilter, radix: int = 10) -> str:
             f"; Coefficient format: {q.fmt} -- the stored values are integers;",
             f"; divide by 2^{q.fmt.frac_bits} to recover the real tap values.",
             f"; Quantization error floor: {q.error_floor_db:.1f} dB.",
+            *_complex_coe_notes(q, component),
             ";",
             f"radix = {radix};",
             "coefdata =",
@@ -93,9 +115,36 @@ def generate_coe(q: QuantizedFilter, radix: int = 10) -> str:
     )
 
 
-def generate_mif(q: QuantizedFilter, radix: int = 2) -> str:
-    """Memory initialisation file: one coefficient word per line."""
-    taps = _require_fir(q, "A .mif file")
+def _complex_coe_notes(q: QuantizedFilter, component: str | None) -> list[str]:
+    """Header lines explaining how a complex coefficient file is laid out."""
+    if not q.is_complex:
+        return []
+    if component is not None:
+        return [
+            ";",
+            f"; COMPLEX FILTER: this is the {component.upper()} coefficient "
+            "set only.",
+        ]
+    return [
+        ";",
+        f"; COMPLEX FILTER: two coefficient sets of {q.int_taps_i.size} taps",
+        "; each, in-phase first and then quadrature. In the Vivado FIR",
+        "; Compiler set 'Number of Coefficient Sets' to 2, or export the I and",
+        "; Q sets separately and instantiate two filters.",
+        "; Filtering a complex stream takes four such convolutions (three if",
+        "; you use the Karatsuba identity to trade a multiply for two adds).",
+    ]
+
+
+def generate_mif(
+    q: QuantizedFilter, radix: int = 2, component: str | None = None
+) -> str:
+    """Memory initialisation file: one coefficient word per line.
+
+    A complex filter writes every in-phase word and then every quadrature
+    word, so one ROM holds both halves back to back.
+    """
+    taps = _require_fir(q, "A .mif file", component)
     width = q.fmt.total_bits
     if radix == 2:
         values = [_twos_complement_bits(v, width) for v in taps]
@@ -115,6 +164,8 @@ def generate_verilog(
     """A synthesisable transposed-form FIR, with its coefficients inlined."""
     if q.int_sos is not None:
         return _verilog_biquads(q, module_name)
+    if q.is_complex:
+        return _verilog_complex_taps(q, module_name)
 
     taps = np.asarray(q.int_taps, dtype=np.int64)
     name = _identifier(module_name or q.design.spec.name)
@@ -227,6 +278,72 @@ def generate_verilog(
     )
 
 
+def _verilog_complex_taps(q: QuantizedFilter, module_name: str | None) -> str:
+    """I and Q coefficient ROMs for a complex FIR, without a filter body.
+
+    No body is generated on purpose. A complex FIR has a structural choice to
+    make -- four real multiplies per tap, or three using the Karatsuba
+    identity -- and pulse compression filters are usually long enough that
+    neither belongs in fabric at all: fast convolution wins past a few hundred
+    taps. Emitting one arbitrary structure would hide that decision rather
+    than inform it.
+    """
+    name = _identifier(module_name or q.design.spec.name)
+    upper = name.upper()
+    width = q.fmt.total_bits
+    taps_i, taps_q = q.int_taps_i, q.int_taps_q
+    n = taps_i.size
+
+    def rom(label: str, values: np.ndarray) -> list[str]:
+        lines = [
+            f"    reg signed [{upper}_COEF_W-1:0] {name}_coeff_{label} "
+            f"[0:{upper}_NTAPS-1];",
+            "    initial begin",
+        ]
+        for i, v in enumerate(values):
+            literal = (
+                f"{width}'sd{int(v)}" if v >= 0 else f"-{width}'sd{abs(int(v))}"
+            )
+            lines.append(f"        {name}_coeff_{label}[{i}] = {literal};")
+        lines.extend(["    end", ""])
+        return lines
+
+    fft_size = 1 << max(int(max(n - 1, 1)).bit_length() + 1, 8)
+    return "\n".join(
+        [
+            "// " + "-" * 70,
+            spec_comment(q.design, prefix="// "),
+            "//",
+            f"// Coefficient format: {q.fmt}",
+            f"// Quantization error floor: {q.error_floor_db:.1f} dB",
+            "//",
+            "// COMPLEX FILTER -- coefficient tables only, no filter body.",
+            "//",
+            "// Filtering a complex stream with complex taps is four real",
+            "// convolutions:",
+            "//     y_i = x_i * h_i - x_q * h_q",
+            "//     y_q = x_i * h_q + x_q * h_i",
+            "// Three multiplies are possible via the Karatsuba identity, at",
+            "// the cost of extra adders.",
+            "//",
+            f"// At {n} taps, consider not doing this in fabric at all:",
+            f"// overlap-save fast convolution with a {fft_size}-point FFT",
+            "// costs far less, and is how pulse compression is normally",
+            "// implemented.",
+            "// " + "-" * 70,
+            "",
+            f"localparam integer {upper}_NTAPS     = {n};",
+            f"localparam integer {upper}_COEF_W    = {width};",
+            f"localparam integer {upper}_COEF_FRAC = {q.fmt.frac_bits};",
+            "",
+            "// In-phase coefficients",
+            *rom("i", taps_i),
+            "// Quadrature coefficients",
+            *rom("q", taps_q),
+        ]
+    )
+
+
 def _verilog_biquads(q: QuantizedFilter, module_name: str | None) -> str:
     """Coefficient tables for an IIR cascade.
 
@@ -314,6 +431,50 @@ def generate_vhdl(
                 "    type coef_array is array (natural range <>) of integer;",
                 f"    constant COEFFS : coef_array(0 to {len(values) - 1}) := (",
                 f"        {table}",
+                "    );",
+                f"end package {name}_pkg;",
+                "",
+            ]
+        )
+
+    if q.is_complex:
+        # Same reasoning as the Verilog export: emit both coefficient sets and
+        # leave the four-multiply structure to the implementer.
+        values_i = [int(v) for v in q.int_taps_i]
+        values_q = [int(v) for v in q.int_taps_q]
+
+        def table_of(values: list[int]) -> str:
+            return ",\n        ".join(
+                ", ".join(str(v) for v in values[i : i + 8])
+                for i in range(0, len(values), 8)
+            )
+
+        return "\n".join(
+            [
+                spec_comment(q.design, prefix="-- "),
+                "--",
+                f"-- Coefficient format: {q.fmt}",
+                f"-- Quantization error floor: {q.error_floor_db:.1f} dB",
+                "--",
+                "-- COMPLEX FILTER -- coefficient tables only. Filtering a",
+                "-- complex stream takes four real convolutions:",
+                "--     y_i = x_i*h_i - x_q*h_q",
+                "--     y_q = x_i*h_q + x_q*h_i",
+                "",
+                "library ieee;",
+                "use ieee.std_logic_1164.all;",
+                "use ieee.numeric_std.all;",
+                "",
+                f"package {name}_pkg is",
+                f"    constant NTAPS     : integer := {len(values_i)};",
+                f"    constant COEF_W    : integer := {coeff_w};",
+                f"    constant COEF_FRAC : integer := {q.fmt.frac_bits};",
+                "    type coef_array is array (natural range <>) of integer;",
+                "    constant COEFFS_I : coef_array(0 to NTAPS-1) := (",
+                f"        {table_of(values_i)}",
+                "    );",
+                "    constant COEFFS_Q : coef_array(0 to NTAPS-1) := (",
+                f"        {table_of(values_q)}",
                 "    );",
                 f"end package {name}_pkg;",
                 "",

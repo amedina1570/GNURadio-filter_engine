@@ -8,7 +8,13 @@ import numpy as np
 
 from ..core.design import FilterDesign
 
-__all__ = ["format_floats", "format_ints", "spec_comment", "timestamp"]
+__all__ = [
+    "format_floats",
+    "format_complex",
+    "format_ints",
+    "spec_comment",
+    "timestamp",
+]
 
 #: Marker every generated file carries, so it is obvious where it came from.
 TOOL_NAME = "filter_engine"
@@ -27,6 +33,22 @@ def format_floats(
     in the generated file are bit-identical to the ones analysed here.
     """
     items = [repr(float(v)) for v in np.asarray(values).ravel()]
+    return _wrap(items, per_line, indent)
+
+
+def format_complex(
+    values: np.ndarray, per_line: int = 2, indent: str = "    "
+) -> str:
+    """Format complex taps as Python literals, wrapped across lines.
+
+    Emitted as ``complex(re, im)`` rather than ``(re+imj)``: the constructor
+    round-trips exactly and stays readable when the imaginary part is
+    negative or written in exponential form.
+    """
+    items = [
+        f"complex({float(v.real)!r}, {float(v.imag)!r})"
+        for v in np.asarray(values).ravel()
+    ]
     return _wrap(items, per_line, indent)
 
 
@@ -61,7 +83,27 @@ def spec_comment(fd: FilterDesign, prefix: str = "# ") -> str:
         f"Sample rate:     {s.sample_rate:,.6g} Hz  (Nyquist {s.nyquist:,.6g} Hz)",
     ]
 
-    if s.response.is_pulse_shaping:
+    if s.response.value == "matched_lfm":
+        lines.append(f"Pulse width:     {s.pulse_width_s * 1e6:,.6g} us")
+        lines.append(f"Chirp bandwidth: {s.chirp_bandwidth_hz / 1e6:,.6g} MHz")
+        lines.append(f"Sweep:           {'down' if s.down_chirp else 'up'}")
+        lines.append(f"Time-bandwidth:  {s.time_bandwidth_product:,.0f}")
+        lines.append(f"Range res:       {s.range_resolution_m:,.4g} m")
+        lines.append(f"Weighting:       {s.window}")
+        if s.window == "taylor":
+            lines.append(f"  Taylor SLL:    {s.taylor_sll_db:g} dB")
+            lines.append(f"  Taylor nbar:   {s.taylor_nbar}")
+        elif s.window == "chebwin":
+            lines.append(f"  Chebyshev:     {s.cheb_atten_db:g} dB")
+        lines.append("Coefficients:    complex (I/Q)")
+    elif s.response.value == "mti_canceller":
+        lines.append(f"Pulses:          {s.mti_pulses}")
+        lines.append(f"PRI:             {s.pri_s * 1e6:,.6g} us "
+                     f"({s.prf_hz:,.6g} Hz PRF)")
+        lines.append(f"Carrier:         {s.radar_carrier_hz / 1e9:,.4g} GHz")
+        lines.append(f"Blind speeds:    every {s.blind_speed_ms:,.4g} m/s")
+        lines.append("Note:            runs in slow time, one sample per PRI")
+    elif s.response.is_pulse_shaping:
         lines.append(f"Symbol rate:     {s.symbol_rate:,.6g} Hz")
         lines.append(f"Samples/symbol:  {s.samples_per_symbol:.6g}")
         if s.response.value.endswith("raised_cosine"):

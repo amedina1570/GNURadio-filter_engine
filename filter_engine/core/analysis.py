@@ -433,7 +433,9 @@ class RadarMetrics:
         return rows
 
 
-def compressed_response(fd: FilterDesign) -> tuple[np.ndarray, np.ndarray]:
+def compressed_response(
+    fd: FilterDesign, oversample: int = 1
+) -> tuple[np.ndarray, np.ndarray]:
     """The compressed pulse: ``(lag_seconds, complex_amplitude)``.
 
     For an LFM matched filter this is the filter's response to the real,
@@ -443,6 +445,13 @@ def compressed_response(fd: FilterDesign) -> tuple[np.ndarray, np.ndarray]:
 
     For any other FIR the autocorrelation is the right analogue, since such a
     filter is its own matched reference.
+
+    ``oversample`` band-limited-interpolates the result. Radar commonly runs
+    only 1.2 to 2 samples per resolution cell, which leaves the compressed
+    mainlobe barely a sample wide -- the raw grid then steps straight over the
+    sidelobe peaks and flatters the measured PSLR by 10 dB or more. Anything
+    *measuring* this response should ask for interpolation; anything plotting
+    the samples the hardware actually produces should not.
     """
     from .radar import lfm_transmit_pulse
 
@@ -460,9 +469,29 @@ def compressed_response(fd: FilterDesign) -> tuple[np.ndarray, np.ndarray]:
     else:
         out = np.convolve(taps, np.conj(taps[::-1]))
 
+    rate = spec.sample_rate
+    if oversample > 1 and out.size > 1:
+        out = _interpolate(out, int(oversample))
+        rate = rate * int(oversample)
+
     peak = int(np.argmax(np.abs(out)))
-    lags = (np.arange(out.size) - peak) / spec.sample_rate
+    lags = (np.arange(out.size) - peak) / rate
     return lags, out
+
+
+def _interpolate(x: np.ndarray, factor: int) -> np.ndarray:
+    """Band-limited interpolation by zero-padding the spectrum.
+
+    Exact for a band-limited signal, which a compressed pulse is by
+    construction, so this adds detail rather than inventing it.
+    """
+    n = x.size
+    spectrum = np.fft.fft(x)
+    padded = np.zeros(n * factor, dtype=complex)
+    half = (n + 1) // 2
+    padded[:half] = spectrum[:half]
+    padded[-(n - half):] = spectrum[half:]
+    return np.fft.ifft(padded) * factor
 
 
 def _mainlobe_bounds(mag: np.ndarray, peak: int) -> tuple[int, int]:
@@ -510,6 +539,66 @@ def _width_at(mag: np.ndarray, peak: int, fraction: float) -> float:
     return max(hi - lo, 0.0)
 
 
+def _measurement_oversample(spec) -> int:
+    """How much to interpolate before measuring sidelobes.
+
+    Aim for at least 16 samples across a resolution cell. Radar often samples
+    at only 1.2x the chirp bandwidth, and on that grid the compressed mainlobe
+    spans about one sample -- far too coarse to find where the sidelobe peaks
+    actually are.
+    """
+    if spec.chirp_bandwidth_hz <= 0 or spec.sample_rate <= 0:
+        return 8
+    samples_per_cell = spec.sample_rate / spec.chirp_bandwidth_hz
+    factor = int(math.ceil(16.0 / max(samples_per_cell, 1e-9)))
+    return int(np.clip(factor, 1, 64))
+
+
+def _explain_sidelobe_shortfall(spec, metrics, notes: list[str]) -> None:
+    """Say why a weighting missed its nominal sidelobe level, if it did.
+
+    Two causes, and they need different fixes, so guessing between them is
+    exactly the help a user wants:
+
+    * ``nbar`` too small for the requested Taylor level -- raise nbar.
+    * time-bandwidth product too low -- the chirp spectrum has Fresnel ripple
+      at its edges that no taper can remove; lengthen the pulse or widen the
+      sweep.
+    """
+    from .radar import minimum_taylor_nbar
+
+    requested = None
+    if spec.window == "taylor":
+        requested = abs(spec.taylor_sll_db)
+    elif spec.window == "chebwin":
+        requested = abs(spec.cheb_atten_db)
+    if requested is None or not np.isfinite(metrics.pslr_db):
+        return
+
+    shortfall = requested - abs(metrics.pslr_db)
+    if shortfall <= 2.0:
+        return
+
+    if spec.window == "taylor":
+        nbar = spec.effective_taylor_nbar
+        minimum = minimum_taylor_nbar(spec.taylor_sll_db)
+        if nbar < minimum:
+            notes.append(
+                f"Sidelobes came out {shortfall:.1f} dB above the "
+                f"{requested:.0f} dB asked for because nbar={nbar} is below "
+                f"the {minimum} this level needs."
+            )
+            return
+
+    notes.append(
+        f"Sidelobes came out {shortfall:.1f} dB above the {requested:.0f} dB "
+        f"asked for. With a time-bandwidth product of "
+        f"{spec.time_bandwidth_product:,.0f}, ripple at the edges of the "
+        "chirp spectrum sets the floor and no weighting can get past it. "
+        "Lengthen the pulse or widen the sweep."
+    )
+
+
 def radar_metrics(fd: FilterDesign) -> RadarMetrics:
     """Measure range sidelobes and resolution from the compressed pulse."""
     from .radar import C_LIGHT, lfm_matched_filter, lfm_transmit_pulse
@@ -518,7 +607,10 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
     metrics = RadarMetrics()
     notes = metrics.notes
 
-    _lags, compressed = compressed_response(fd)
+    # Measure on an interpolated grid: see compressed_response.
+    oversample = _measurement_oversample(spec)
+    _lags, compressed = compressed_response(fd, oversample=oversample)
+    fine_rate = spec.sample_rate * oversample
     mag = np.abs(compressed)
     if mag.size < 5 or np.max(mag) <= 0:
         notes.append("The compressed pulse is too short to measure.")
@@ -538,11 +630,10 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
         if main_energy > 0:
             metrics.islr_db = 10.0 * math.log10(max(side_energy / main_energy, 1e-30))
 
-    fs = spec.sample_rate
     width_3db = _width_at(mag, peak, 10 ** (-3.0 / 20.0))
-    metrics.mainlobe_3db_s = width_3db / fs
-    metrics.mainlobe_3db_m = width_3db / fs * C_LIGHT / 2.0
-    metrics.mainlobe_null_s = (right - left) / fs
+    metrics.mainlobe_3db_s = width_3db / fine_rate
+    metrics.mainlobe_3db_m = width_3db / fine_rate * C_LIGHT / 2.0
+    metrics.mainlobe_null_s = (right - left) / fine_rate
 
     if spec.response is not Response.MATCHED_LFM:
         return metrics
@@ -567,7 +658,10 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
     tx = lfm_transmit_pulse(
         spec.sample_rate, spec.pulse_width_s, spec.chirp_bandwidth_hz, spec.down_chirp
     )
-    plain = np.abs(np.convolve(unweighted, tx))
+    plain = np.convolve(unweighted, tx)
+    if oversample > 1:
+        plain = _interpolate(plain, oversample)
+    plain = np.abs(plain)
     plain_peak = int(np.argmax(plain))
     plain = plain / plain[plain_peak]
     plain_width = _width_at(plain, plain_peak, 10 ** (-3.0 / 20.0))
@@ -586,6 +680,7 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
             efficiency = float(np.sum(weights)) ** 2 / denominator
             metrics.weighting_loss_db = -10.0 * math.log10(max(efficiency, 1e-30))
 
+    _explain_sidelobe_shortfall(spec, metrics, notes)
     if spec.time_bandwidth_product < 50:
         notes.append(
             f"A time-bandwidth product of {spec.time_bandwidth_product:,.0f} is "

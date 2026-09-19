@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from ..core.design import FilterDesign
 from ..core.spec import FilterFamily, FirMethod, Response
-from ._common import format_floats, spec_comment
+from ._common import format_complex, format_floats, spec_comment
 
 __all__ = ["generate"]
 
@@ -117,7 +117,7 @@ def _fir_taps_section(fd: FilterDesign) -> list[str]:
     lines.extend(
         [
             "TAPS = [",
-            format_floats(fd.b),
+            format_complex(fd.b) if fd.is_complex else format_floats(fd.b),
             "]",
             "",
         ]
@@ -134,6 +134,10 @@ def _firdes_call(fd: FilterDesign) -> list[str] | None:
     fs = s.sample_rate
     gain = s.gain
 
+    if s.response.is_radar:
+        # firdes has no pulse compression or MTI design; the taps are emitted
+        # directly and the standalone Python target carries the closed form.
+        return None
     if s.response is Response.RRC:
         return [
             "return firdes.root_raised_cosine(",
@@ -197,8 +201,15 @@ def _firdes_call(fd: FilterDesign) -> list[str] | None:
 
 
 def _fir_block(fd: FilterDesign, name: str, complex_io: bool) -> list[str]:
+    # Complex taps force a complex stream and the ccc block: GNU Radio's
+    # fir_filter_ccf takes *float* taps and would silently drop the quadrature
+    # half of a matched filter.
+    if fd.is_complex:
+        complex_io = True
+        block = "fir_filter_ccc"
+    else:
+        block = "fir_filter_ccf" if complex_io else "fir_filter_fff"
     io_type = "gr.sizeof_gr_complex" if complex_io else "gr.sizeof_float"
-    block = "fir_filter_ccf" if complex_io else "fir_filter_fff"
     stream = "complex" if complex_io else "float"
 
     return [

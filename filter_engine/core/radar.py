@@ -35,6 +35,7 @@ __all__ = [
     "mti_canceller",
     "WEIGHTINGS",
     "weighting_window",
+    "minimum_taylor_nbar",
 ]
 
 #: Speed of light in vacuum, m/s.
@@ -176,6 +177,26 @@ _WEIGHTING_BY_NAME = {w.name: w for w in WEIGHTINGS}
 
 def get_weighting(name: str) -> Weighting | None:
     return _WEIGHTING_BY_NAME.get(name)
+
+
+def minimum_taylor_nbar(sll_db: float) -> int:
+    """Smallest ``nbar`` that can actually deliver ``sll_db`` of suppression.
+
+    Taylor's own constraint: the number of flat-topped sidelobes has to grow
+    with the depth you ask for, or the design degenerates and the realised
+    sidelobes sit well above the nominal level. The standard rule is
+
+        nbar >= 2*A^2 + 0.5,   A = arccosh(10^(SLL/20)) / pi
+
+    Asking for 50 dB with ``nbar=4`` quietly gets you 45 -- one of the most
+    common ways a Taylor taper disappoints, and the reason this tool derives
+    ``nbar`` by default rather than leaving it at a fixed value.
+    """
+    sll = abs(float(sll_db))
+    if sll <= 0:
+        return 1
+    a = math.acosh(10.0 ** (sll / 20.0)) / math.pi
+    return max(1, int(math.ceil(2.0 * a * a + 0.5)))
 
 
 def weighting_window(

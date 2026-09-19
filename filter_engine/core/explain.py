@@ -229,6 +229,12 @@ PARAM_HELP: dict[str, str] = {
         "35 dB is a common radar choice. Lower sidelobes cost mainlobe width "
         "-- that is, range resolution -- and a fraction of a dB of SNR."
     ),
+    "auto_taylor_nbar": (
+        "Work out nbar from the sidelobe level you asked for. Leave this on "
+        "unless you have a reason not to: the two parameters are coupled, and "
+        "an nbar that is too small quietly gives you several dB worse "
+        "sidelobes than you designed for."
+    ),
     "taylor_nbar": (
         "How many sidelobes either side of the peak are held flat at the "
         "design level before they start falling away. 4 to 6 is the usual "

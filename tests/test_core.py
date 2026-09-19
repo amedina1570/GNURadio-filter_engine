@@ -336,7 +336,15 @@ def test_a_slow_clock_is_reported_as_infeasible():
 @pytest.mark.parametrize("kind", list(signals.PulseKind))
 def test_every_excitation_generates_and_filters(kind):
     ps = signals.PulseSpec(
-        kind=kind, sample_rate=1e6, duration_s=2e-3, width_s=5e-5, delay_s=3e-4
+        kind=kind,
+        sample_rate=1e6,
+        duration_s=2e-3,
+        width_s=5e-5,
+        delay_s=3e-4,
+        # The radar kinds are specified in chirp bandwidth, which has to fit
+        # inside the sample rate; the default is an X-band figure.
+        lfm_bandwidth_hz=800e3,
+        target_separation_s=2e-5,
     )
     generated = signals.generate(ps)
     assert generated.x.size == ps.num_samples

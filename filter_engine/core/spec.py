@@ -160,6 +160,10 @@ class FilterSpec:
     #: better-controlled near-in sidelobe region; too many and the taper
     #: develops end spikes and loses efficiency.  4 to 6 is the usual choice.
     taylor_nbar: int = 4
+    #: Derive :attr:`taylor_nbar` from :attr:`taylor_sll_db` instead of using
+    #: the value above.  On by default: nbar has to grow with the sidelobe
+    #: depth you ask for, and getting it wrong silently costs several dB.
+    auto_taylor_nbar: bool = True
     #: Taylor: the design sidelobe level, in dB below the mainlobe peak.
     taylor_sll_db: float = 35.0
     #: Dolph-Chebyshev: every sidelobe sits exactly this far below the peak.
@@ -215,6 +219,15 @@ class FilterSpec:
         return self.sample_rate / self.symbol_rate
 
     # ------------------------------------------------------- radar quantities
+    @property
+    def effective_taylor_nbar(self) -> int:
+        """The nbar the design will actually use."""
+        if not self.auto_taylor_nbar:
+            return self.taylor_nbar
+        from .radar import minimum_taylor_nbar
+
+        return minimum_taylor_nbar(self.taylor_sll_db)
+
     @property
     def prf_hz(self) -> float:
         """Pulse repetition frequency, the reciprocal of the PRI."""

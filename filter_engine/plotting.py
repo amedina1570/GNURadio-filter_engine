@@ -31,6 +31,10 @@ __all__ = [
     "plot_overview",
     "plot_pulse_time",
     "plot_pulse_spectrum",
+    "plot_compressed_pulse",
+    "plot_weighting",
+    "plot_ambiguity",
+    "plot_mti_velocity",
 ]
 
 IDEAL = dict(color="tab:blue", linewidth=1.4)
@@ -317,6 +321,29 @@ def plot_taps(
         fig.colorbar(im, ax=ax, label="Coefficient value")
         return
 
+    if fd.is_complex:
+        # Showing only the real part would look like an unmodulated pulse and
+        # hide the chirp entirely; the envelope is where the weighting shows.
+        ax = fig.add_subplot(111)
+        ax.plot(np.real(fd.b), linewidth=0.9, alpha=0.75, label="I")
+        ax.plot(np.imag(fd.b), linewidth=0.9, alpha=0.75, label="Q")
+        ax.plot(
+            np.abs(fd.b),
+            linewidth=1.6,
+            color="k",
+            alpha=0.75,
+            label="envelope (the weighting)",
+        )
+        ax.set_xlabel("Tap index")
+        ax.set_ylabel("Value")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.set_title(
+            f"{fd.num_taps} complex taps - {fd.spec.name} "
+            f"({fd.spec.window} weighting)"
+        )
+        _grid(ax)
+        return
+
     if quantized is None or not quantized.usable:
         ax = fig.add_subplot(111)
         ax.plot(fd.b, ".-", markersize=3, **IDEAL)
@@ -478,4 +505,236 @@ def plot_pulse_spectrum(
     ax.set_ylim(-140, 5)
     ax.legend(loc="upper right", fontsize=8)
     ax.set_title("Pulse spectrum")
+    _grid(ax)
+
+
+# --------------------------------------------------------------------------
+# Radar plots
+# --------------------------------------------------------------------------
+def plot_compressed_pulse(
+    fig: Figure,
+    fd: FilterDesign,
+    span_cells: float = 40.0,
+    show_metrics: bool = True,
+) -> None:
+    """The compressed pulse, in dB, against relative range.
+
+    This is the plot a pulse compression design lives or dies by. The peak is
+    the target; everything either side of it is range sidelobe, and anything
+    weaker than the worst sidelobe is invisible no matter how long you
+    integrate.
+    """
+    from .core import analysis
+    from .core.radar import C_LIGHT
+
+    ax = fig.add_subplot(111)
+    # Interpolate to match what radar_metrics measures, or the annotated peak
+    # sidelobe line would sit above a curve that never appears to reach it.
+    lags, compressed = analysis.compressed_response(
+        fd, oversample=analysis._measurement_oversample(fd.spec)
+    )
+    mag = np.abs(compressed)
+    peak = float(np.max(mag))
+    if peak <= 0:
+        ax.text(0.5, 0.5, "No compressed response", ha="center", va="center")
+        ax.set_axis_off()
+        return
+    mag_db = analysis.db20(mag / peak)
+
+    # Decide the visible window first, then pick the unit from *that*. Scaling
+    # to the full correlation instead would label a 300 m view in kilometres.
+    spec = fd.spec
+    half_m = None
+    if spec.chirp_bandwidth_hz > 0:
+        half_m = span_cells * C_LIGHT / (2.0 * spec.chirp_bandwidth_hz)
+
+    ranges_m = lags * C_LIGHT / 2.0
+    span = half_m if half_m else float(np.max(np.abs(ranges_m)) or 1.0)
+    divisor, unit = (1000.0, "km") if span >= 1000.0 else (1.0, "m")
+
+    ax.plot(ranges_m / divisor, mag_db, **IDEAL)
+    if half_m:
+        ax.set_xlim(-half_m / divisor, half_m / divisor)
+
+    metrics = analysis.radar_metrics(fd)
+    if show_metrics and np.isfinite(metrics.pslr_db):
+        ax.axhline(
+            metrics.pslr_db,
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"peak sidelobe {metrics.pslr_db:.1f} dB",
+        )
+        ax.axhline(-3.0, color="tab:grey", linestyle=":", linewidth=0.8)
+        ax.legend(loc="upper right", fontsize=8)
+
+    floor = -90.0
+    if np.isfinite(metrics.pslr_db):
+        floor = min(-90.0, metrics.pslr_db - 25.0)
+    ax.set_ylim(max(floor, -140.0), 5.0)
+    ax.set_xlabel(f"Range relative to the target ({unit})")
+    ax.set_ylabel("Compressed amplitude (dB)")
+
+    title = f"Compressed pulse - {spec.name}"
+    if np.isfinite(metrics.mainlobe_3db_m):
+        title += f"   resolution {metrics.mainlobe_3db_m:,.3g} m"
+    ax.set_title(title)
+    _grid(ax)
+
+
+def plot_weighting(fig: Figure, fd: FilterDesign) -> None:
+    """The weighting window itself, and what it does to the spectrum."""
+    from .core import analysis
+    from .core.radar import weighting_window
+
+    spec = fd.spec
+    n = fd.num_taps
+    top, bottom = fig.subplots(2, 1)
+
+    window = weighting_window(
+        spec.window,
+        n,
+        spec.taylor_nbar,
+        spec.taylor_sll_db,
+        spec.cheb_atten_db,
+        spec.window_param,
+    )
+    top.plot(window, **IDEAL)
+    top.set_ylabel("Weight")
+    top.set_xlabel("Tap index")
+    top.set_title(f"{spec.window} weighting across {n} taps", fontsize=10)
+    _grid(top)
+
+    # The transform of the taper is what the compressed sidelobes look like.
+    pad = 32
+    spectrum = np.abs(np.fft.fftshift(np.fft.fft(window, n * pad)))
+    spectrum = analysis.db20(spectrum / np.max(spectrum))
+    bins = (np.arange(spectrum.size) - spectrum.size // 2) / pad
+    bottom.plot(bins, spectrum, **IDEAL)
+    bottom.set_xlim(-20, 20)
+    bottom.set_ylim(-120, 5)
+    bottom.set_xlabel("Offset from the peak (resolution cells)")
+    bottom.set_ylabel("Response (dB)")
+    bottom.set_title("Weighting transform: the sidelobe pattern it produces", fontsize=10)
+
+    if spec.window == "taylor":
+        bottom.axhline(
+            -abs(spec.taylor_sll_db),
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"design level {-abs(spec.taylor_sll_db):.0f} dB",
+        )
+        bottom.legend(loc="upper right", fontsize=8)
+    elif spec.window == "chebwin":
+        bottom.axhline(
+            -abs(spec.cheb_atten_db),
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"design level {-abs(spec.cheb_atten_db):.0f} dB",
+        )
+        bottom.legend(loc="upper right", fontsize=8)
+    _grid(bottom)
+
+
+def plot_ambiguity(
+    fig: Figure, fd: FilterDesign, num_doppler: int = 101, dynamic_range_db: float = 60.0
+) -> None:
+    """Range-Doppler ambiguity surface.
+
+    The diagonal ridge of an LFM waveform is range-Doppler coupling: a moving
+    target still compresses to a sharp peak, but at the wrong range. Reading
+    the slope off this plot tells you how much range error a given closing
+    speed produces.
+    """
+    from .core import analysis
+    from .core.radar import C_LIGHT
+
+    spec = fd.spec
+    # Keep the surface cheap enough to redraw interactively.
+    decimation = max(1, fd.num_taps // 400)
+    delays, dopplers, grid = analysis.ambiguity_function(
+        fd, num_doppler=num_doppler, delay_decimation=decimation
+    )
+
+    ranges = delays * C_LIGHT / 2.0
+    ax = fig.add_subplot(111)
+    mesh = ax.pcolormesh(
+        ranges,
+        dopplers / 1e3,
+        grid,
+        cmap="viridis",
+        vmin=-dynamic_range_db,
+        vmax=0.0,
+        shading="auto",
+    )
+    fig.colorbar(mesh, ax=ax, label="Response (dB)")
+
+    if spec.chirp_bandwidth_hz > 0:
+        cell = C_LIGHT / (2.0 * spec.chirp_bandwidth_hz)
+        ax.set_xlim(-40 * cell, 40 * cell)
+
+    ax.set_xlabel("Range offset (m)")
+    ax.set_ylabel("Doppler (kHz)")
+
+    title = f"Ambiguity surface - {spec.name}"
+    if spec.pulse_width_s > 0 and spec.chirp_bandwidth_hz > 0:
+        # Range-Doppler coupling for an LFM: dR = -c * fd * tau / (2 * B).
+        coupling = C_LIGHT * spec.pulse_width_s / (2.0 * spec.chirp_bandwidth_hz)
+        per_ms = coupling * 2.0 / (C_LIGHT / spec.radar_carrier_hz)
+        title += f"   coupling {per_ms:,.3g} m per m/s"
+    ax.set_title(title, fontsize=10)
+
+
+def plot_mti_velocity(fig: Figure, fd: FilterDesign) -> None:
+    """MTI canceller response against radial velocity.
+
+    The notch at zero is the clutter rejection you wanted. The notches at the
+    blind speeds are the price: a target at one of those is removed just as
+    thoroughly as the clutter.
+    """
+    from .core import analysis
+    from .core.radar import blind_speed_ms
+
+    spec = fd.spec
+    ax = fig.add_subplot(111)
+    velocities, response = analysis.mti_velocity_response(fd)
+    peak = float(np.max(response))
+    ax.plot(velocities, response - peak, **IDEAL)
+
+    blind = blind_speed_ms(spec.pri_s, spec.radar_carrier_hz)
+    n = 1
+    while blind * n <= velocities[-1] if blind > 0 else False:
+        ax.axvline(
+            blind * n,
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.0,
+            label="blind speed" if n == 1 else None,
+        )
+        n += 1
+        if n > 8:
+            break
+
+    ax.axvline(0.0, color="tab:green", linestyle=":", linewidth=1.2)
+    ax.text(
+        0.01,
+        0.05,
+        f"Clutter notch at 0 m/s. Blind speeds every {blind:,.4g} m/s.",
+        transform=ax.transAxes,
+        fontsize=8,
+        alpha=0.8,
+    )
+    ax.set_ylim(-80, 5)
+    ax.set_xlabel("Radial velocity (m/s)")
+    ax.set_ylabel("Response (dB)")
+    ax.set_title(
+        f"{spec.mti_pulses}-pulse MTI response - "
+        f"{spec.prf_hz:,.6g} Hz PRF at {spec.radar_carrier_hz / 1e9:,.4g} GHz",
+        fontsize=10,
+    )
+    handles, _labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="upper right", fontsize=8)
     _grid(ax)

@@ -231,7 +231,7 @@ def _design_radar(spec: FilterSpec) -> FilterDesign:
         bandwidth_hz=spec.chirp_bandwidth_hz,
         window=spec.window,
         down_chirp=spec.down_chirp,
-        taylor_nbar=spec.taylor_nbar,
+        taylor_nbar=spec.effective_taylor_nbar,
         taylor_sll_db=spec.taylor_sll_db,
         cheb_atten_db=spec.cheb_atten_db,
         kaiser_beta=spec.window_param,
@@ -250,6 +250,22 @@ def _design_radar(spec: FilterSpec) -> FilterDesign:
         "bandwidth alone.",
         f"Weighting: {spec.window}. Taps are complex (I/Q).",
     ]
+    if spec.window == "taylor":
+        nbar = spec.effective_taylor_nbar
+        minimum = radar.minimum_taylor_nbar(spec.taylor_sll_db)
+        notes.append(
+            f"Taylor weighting: {spec.taylor_sll_db:g} dB design sidelobe "
+            f"level with nbar={nbar}"
+            + (" (derived from the sidelobe level)." if spec.auto_taylor_nbar
+               else ".")
+        )
+        if nbar < minimum:
+            notes.append(
+                f"WARNING: nbar={nbar} is too small for a "
+                f"{spec.taylor_sll_db:g} dB design. Taylor needs nbar of at "
+                f"least {minimum} to hold that level; below it the realised "
+                "sidelobes sit several dB higher than asked for."
+            )
     if spec.window == "boxcar":
         notes.append(
             "Unweighted: range sidelobes will sit near -13 dB, so a strong "

@@ -376,6 +376,130 @@ FILTER_PRESETS: tuple[Preset, ...] = (
         ),
         tags=("audio",),
     ),
+    # --- radar ---------------------------------------------------------------
+    Preset(
+        name="Pulse compression, Taylor 35 dB (X-band)",
+        description=(
+            "A 20 us chirp swept over 20 MHz, compressed 400:1 for 26 dB of "
+            "processing gain and 7.5 m range resolution. Taylor weighting at "
+            "35 dB is the standard radar starting point: sidelobes low enough "
+            "that a strong target does not mask its neighbours, for about "
+            "0.9 dB of SNR and a third more mainlobe width."
+        ),
+        spec=FilterSpec(
+            name="pulse_compression",
+            response=Response.MATCHED_LFM,
+            sample_rate=25e6,
+            pulse_width_s=20e-6,
+            chirp_bandwidth_hz=20e6,
+            pri_s=1e-3,
+            radar_carrier_hz=10e9,
+            window="taylor",
+            taylor_sll_db=35.0,
+            taylor_nbar=4,
+        ),
+        tags=("radar", "pulse_compression"),
+    ),
+    Preset(
+        name="Pulse compression, unweighted (best resolution)",
+        description=(
+            "The same chirp with no weighting. The matched filter is optimal "
+            "for SNR and gives the narrowest mainlobe, but -13 dB range "
+            "sidelobes mean anything more than about 13 dB weaker than a "
+            "nearby target is invisible. Compare its compressed pulse against "
+            "the Taylor preset."
+        ),
+        spec=FilterSpec(
+            name="pulse_compression_plain",
+            response=Response.MATCHED_LFM,
+            sample_rate=25e6,
+            pulse_width_s=20e-6,
+            chirp_bandwidth_hz=20e6,
+            pri_s=1e-3,
+            radar_carrier_hz=10e9,
+            window="boxcar",
+        ),
+        tags=("radar", "pulse_compression"),
+    ),
+    Preset(
+        name="High-resolution compression (1 m, Taylor 45 dB)",
+        description=(
+            "150 MHz of chirp for 1 m range resolution, weighted hard at "
+            "45 dB. This is imaging-radar territory -- note how far the "
+            "sample rate and the tap count have to climb."
+        ),
+        spec=FilterSpec(
+            name="hires_compression",
+            response=Response.MATCHED_LFM,
+            sample_rate=200e6,
+            pulse_width_s=10e-6,
+            chirp_bandwidth_hz=150e6,
+            pri_s=200e-6,
+            radar_carrier_hz=10e9,
+            window="taylor",
+            taylor_sll_db=45.0,
+            taylor_nbar=6,
+        ),
+        tags=("radar", "pulse_compression", "sar"),
+    ),
+    Preset(
+        name="Two-pulse MTI canceller (X-band, 1 kHz PRF)",
+        description=(
+            "The simplest clutter canceller: subtract each pulse from the "
+            "last. Deep null at zero Doppler, and blind speeds every 15 m/s "
+            "at these settings. Look at the velocity response to see what it "
+            "costs you."
+        ),
+        spec=FilterSpec(
+            name="mti_2pulse",
+            response=Response.MTI_CANCELLER,
+            sample_rate=1000.0,
+            pri_s=1e-3,
+            mti_pulses=2,
+            radar_carrier_hz=10e9,
+        ),
+        tags=("radar", "mti", "doppler"),
+    ),
+    Preset(
+        name="Three-pulse MTI canceller (deeper notch)",
+        description=(
+            "Two cancellers in series. The clutter notch is far deeper and "
+            "flatter, but it is also wider, so slow-moving targets go with "
+            "the clutter. The blind speeds are unchanged -- only the PRF "
+            "moves those."
+        ),
+        spec=FilterSpec(
+            name="mti_3pulse",
+            response=Response.MTI_CANCELLER,
+            sample_rate=1000.0,
+            pri_s=1e-3,
+            mti_pulses=3,
+            radar_carrier_hz=10e9,
+        ),
+        tags=("radar", "mti", "doppler"),
+    ),
+    Preset(
+        name="Radar IF anti-alias (Taylor-weighted)",
+        description=(
+            "A conventional lowpass ahead of the ADC, but tapered with a "
+            "Taylor window so its stopband behaviour matches the rest of the "
+            "radar chain."
+        ),
+        spec=FilterSpec(
+            name="radar_antialias",
+            family=FilterFamily.FIR,
+            response=Response.LOWPASS,
+            fir_method=FirMethod.WINDOW,
+            window="taylor",
+            taylor_sll_db=60.0,
+            taylor_nbar=5,
+            sample_rate=100e6,
+            f_low=20e6,
+            transition_width=5e6,
+            stopband_atten_db=60.0,
+        ),
+        tags=("radar", "sdr"),
+    ),
     Preset(
         name="Hilbert transformer (SSB generation)",
         description=(
