@@ -106,12 +106,15 @@ def _fir_body(fd: FilterDesign, name: str) -> list[str]:
             '    """',
             "",
             "    def __init__(self, taps: np.ndarray | None = None) -> None:",
-            "        self.taps = np.asarray(TAPS if taps is None else taps, dtype=float)",
+            # No dtype: forcing float here would silently throw away the
+            # quadrature half of a complex matched filter.
+            "        self.taps = np.asarray(TAPS if taps is None else taps)",
             "        self.reset()",
             "",
             "    def reset(self) -> None:",
             '        """Clear the filter state."""',
-            "        self._zi = np.zeros(self.taps.size - 1)",
+            "        dtype = complex if np.iscomplexobj(self.taps) else float",
+            "        self._zi = np.zeros(self.taps.size - 1, dtype=dtype)",
             "",
             "    def __call__(self, x: np.ndarray) -> np.ndarray:",
             '        """Filter one block, carrying state across calls."""',
@@ -314,8 +317,12 @@ def _window_expression(spec, length: str) -> str:
     the emitted ``design_taps()`` will disagree with the emitted ``TAPS``.
     """
     if spec.window == "taylor":
+        # effective_taylor_nbar, not taylor_nbar: with derivation on, the
+        # design uses the value implied by the sidelobe level, and emitting
+        # the raw field would generate a different filter.
         return (
-            f"signal.windows.taylor({length}, nbar={spec.taylor_nbar}, "
+            f"signal.windows.taylor({length}, "
+            f"nbar={spec.effective_taylor_nbar}, "
             f"sll={abs(spec.taylor_sll_db)!r}, norm=True, sym=True)"
         )
     if spec.window == "chebwin":

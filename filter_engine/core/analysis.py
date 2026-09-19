@@ -683,7 +683,11 @@ def radar_metrics(fd: FilterDesign) -> RadarMetrics:
         denominator = n * float(np.sum(weights**2))
         if denominator > 0:
             efficiency = float(np.sum(weights)) ** 2 / denominator
-            metrics.weighting_loss_db = -10.0 * math.log10(max(efficiency, 1e-30))
+            loss = -10.0 * math.log10(max(efficiency, 1e-30))
+            # The matched filter is the SNR optimum, so a taper can only cost.
+            # Rounding leaves a rectangular window at about -4e-9 dB, which
+            # prints as "-0.00 dB" and reads like a free lunch.
+            metrics.weighting_loss_db = max(loss, 0.0)
 
     _explain_sidelobe_shortfall(spec, metrics, notes)
     if spec.time_bandwidth_product < 50:
