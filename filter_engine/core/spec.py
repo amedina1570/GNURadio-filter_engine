@@ -123,8 +123,13 @@ class FilterSpec:
     order: int = 4
 
     # --- FIR window options --------------------------------------------------
-    window: str = "hamming"
-    #: Kaiser beta.  Only read when :attr:`window` is ``"kaiser"``.
+    #: Kaiser by default: it is the only fixed window whose stopband is not
+    #: capped by its own sidelobes, so the default design actually meets the
+    #: default tolerances. A Hamming window tops out near 53 dB and would
+    #: miss the 60 dB below however many taps it were given.
+    window: str = "kaiser"
+    #: Kaiser beta.  Only read when :attr:`window` is ``"kaiser"`` and
+    #: :attr:`auto_order` is off; otherwise it is derived from the stopband.
     window_param: float = 8.6
 
     # --- pulse shaping -------------------------------------------------------

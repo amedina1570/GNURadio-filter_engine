@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filter-engine"
+version = "0.1.0"
+description = "Digital filter design, analysis and code generation for SDR and FPGA targets"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Arnaldy Medina", email = "arnaldyjr@hotmail.com" }]
+keywords = ["dsp", "filter", "sdr", "gnuradio", "usrp", "fpga", "artix-7", "verilog"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "matplotlib>=3.7"]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+dev = ["pytest>=7.0", "PySide6>=6.5"]
+
+[project.scripts]
+filter-engine = "filter_engine.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["filter_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # Our own code must not emit these; a third-party plugin does.
+    "ignore:distutils Version classes are deprecated:DeprecationWarning",
+]

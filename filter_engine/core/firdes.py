@@ -245,6 +245,10 @@ def _odd_taps(sps: float, span_symbols: int) -> int:
 # --------------------------------------------------------------------------
 # Order estimation
 # --------------------------------------------------------------------------
+#: Extra taps added to Bellanger's equiripple estimate. See its use below.
+BELLANGER_MARGIN_TAPS = 4
+
+
 def ripple_to_delta(passband_ripple_db: float, stopband_atten_db: float) -> tuple[float, float]:
     """Convert dB tolerances to linear deviations ``(delta_p, delta_s)``.
 
@@ -323,10 +327,18 @@ def estimate_fir_taps(
                 * (sample_rate / transition_width)
             )
         )
+        # Bellanger is an approximation and it errs low: across band types and
+        # attenuations the bare estimate misses the requested mask about a
+        # third of the time, usually on passband ripple rather than stopband.
+        # A few extra taps costs almost nothing and makes an automatically
+        # ordered design actually meet what was asked for, which is the whole
+        # point of asking for it automatically.
+        ntaps += BELLANGER_MARGIN_TAPS
         note = (
             f"Bellanger estimate for {passband_ripple_db:.3g} dB ripple / "
             f"{stopband_atten_db:.1f} dB stopband over a "
-            f"{transition_width:.6g} Hz transition"
+            f"{transition_width:.6g} Hz transition, plus a "
+            f"{BELLANGER_MARGIN_TAPS}-tap margin"
         )
     else:  # freq_sampling and anything else -- fall back to the harris rule
         ntaps = int(math.ceil(stopband_atten_db * sample_rate / (22.0 * transition_width)))
