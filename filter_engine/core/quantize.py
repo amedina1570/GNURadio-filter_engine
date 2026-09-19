@@ -100,7 +100,16 @@ class FixedPointFormat:
         Precision is maximised by giving every bit not needed for the integer
         range to the fraction.
         """
-        peak = float(np.max(np.abs(np.asarray(values, dtype=float))))
+        values = np.asarray(values)
+        if np.iscomplexobj(values):
+            # Real and imaginary parts are stored in separate words, so what
+            # has to fit is the larger of the two -- not the magnitude, which
+            # would waste up to half a bit on every complex filter.
+            peak = float(
+                max(np.max(np.abs(values.real)), np.max(np.abs(values.imag)))
+            )
+        else:
+            peak = float(np.max(np.abs(values.astype(float))))
         if peak == 0.0 or not math.isfinite(peak):
             return cls(total_bits, total_bits - 1, signed)
 
@@ -122,13 +131,27 @@ class FixedPointFormat:
         return fmt
 
     def quantize(self, values: np.ndarray) -> tuple[np.ndarray, bool]:
-        """Round ``values`` onto the grid.  Returns ``(integers, clipped)``."""
-        raw = np.round(np.asarray(values, dtype=float) * self.scale)
+        """Round ``values`` onto the grid.  Returns ``(integers, clipped)``.
+
+        Complex input is rounded component-wise and returned as a complex
+        array with integral parts, which is what a fixed-point I/Q filter
+        actually holds: two integer words per tap.
+        """
+        values = np.asarray(values)
+        if np.iscomplexobj(values):
+            real, clipped_r = self.quantize(values.real)
+            imag, clipped_i = self.quantize(values.imag)
+            return real + 1j * imag, (clipped_r or clipped_i)
+
+        raw = np.round(values.astype(float) * self.scale)
         clipped = bool(np.any(raw > self.max_int) or np.any(raw < self.min_int))
         return np.clip(raw, self.min_int, self.max_int).astype(np.int64), clipped
 
     def dequantize(self, integers: np.ndarray) -> np.ndarray:
-        return np.asarray(integers, dtype=float) / self.scale
+        integers = np.asarray(integers)
+        if np.iscomplexobj(integers):
+            return integers / self.scale
+        return integers.astype(float) / self.scale
 
 
 @dataclass
@@ -177,6 +200,24 @@ class QuantizedFilter:
     def usable(self) -> bool:
         """Whether this word length yields a filter worth implementing."""
         return self.stable and not self.degenerate and not self.clipped
+
+    @property
+    def is_complex(self) -> bool:
+        return bool(np.iscomplexobj(self.int_taps))
+
+    @property
+    def int_taps_i(self) -> np.ndarray:
+        """In-phase integer coefficients."""
+        taps = np.asarray(self.int_taps)
+        return (taps.real if np.iscomplexobj(taps) else taps).astype(np.int64)
+
+    @property
+    def int_taps_q(self) -> np.ndarray:
+        """Quadrature integer coefficients; all zero for a real filter."""
+        taps = np.asarray(self.int_taps)
+        if not np.iscomplexobj(taps):
+            return np.zeros(taps.size, dtype=np.int64)
+        return taps.imag.astype(np.int64)
 
     @property
     def quantized_design(self) -> FilterDesign:
@@ -269,7 +310,11 @@ def _quantize_fir(
             "reduce the filter gain."
         )
 
-    symmetric = bool(np.array_equal(int_taps, int_taps[::-1]))
+    # A complex matched filter is conjugate-symmetric at best, which the
+    # folded real structure cannot exploit, so only real taps count here.
+    symmetric = not np.iscomplexobj(int_taps) and bool(
+        np.array_equal(int_taps, int_taps[::-1])
+    )
     if symmetric:
         notes.append(
             "Taps are symmetric: a folded FIR structure needs only "
@@ -347,14 +392,14 @@ def _measure_quantization(
     fd: FilterDesign, q: QuantizedFilter, num_points: int
 ) -> None:
     """Fill in the measured error fields of ``q``."""
-    ideal = np.asarray(fd.sos if fd.sos is not None else fd.b, dtype=float)
+    ideal = np.asarray(fd.sos if fd.sos is not None else fd.b)
     actual = q.fmt.dequantize(
         q.int_sos if q.int_sos is not None else q.int_taps
     ).reshape(ideal.shape)
 
     error = actual - ideal
-    signal_power = float(np.sum(ideal**2))
-    noise_power = float(np.sum(error**2))
+    signal_power = float(np.sum(np.abs(ideal) ** 2))
+    noise_power = float(np.sum(np.abs(error) ** 2))
     if noise_power <= 0.0:
         q.coefficient_snr_db = float("inf")
     elif signal_power <= 0.0:
@@ -487,6 +532,16 @@ def estimate_fpga(
     else:
         num_taps = int(q.int_taps.size)
         effective = math.ceil(num_taps / 2) if q.symmetric else num_taps
+        if q.is_complex:
+            # Complex coefficients against a complex data stream: four real
+            # multiplies per tap (or three with the Karatsuba trick, at the
+            # cost of extra adds).
+            effective *= 4
+            notes.append(
+                "Complex (I/Q) coefficients: each tap costs four real "
+                "multiplies against a complex input stream. Three is possible "
+                "with the Karatsuba identity if DSP slices are tight."
+            )
         if q.symmetric:
             notes.append(
                 "Symmetric taps folded: pre-add the mirrored sample pairs and "
@@ -494,6 +549,22 @@ def estimate_fpga(
             )
 
     dsp = max(1, math.ceil(effective / cycles))
+
+    # Past a few hundred taps a direct-form FIR stops being the sensible
+    # implementation. Pulse compression filters routinely run to thousands of
+    # taps, and those are built as fast convolution -- FFT, multiply, inverse
+    # FFT -- whose cost grows as N log N instead of N. Reporting a DSP count
+    # in the thousands without saying so would be technically true and
+    # practically useless.
+    if num_taps > 256:
+        fft_size = 1 << max(int(num_taps - 1).bit_length() + 1, 8)
+        notes.append(
+            f"At {num_taps} taps a direct FIR is the wrong structure. Use fast "
+            f"convolution (overlap-save with a {fft_size}-point FFT): the work "
+            f"drops from {num_taps} multiplies per sample to roughly "
+            f"{int(math.log2(fft_size)) * 2}, and Vivado's FFT core handles "
+            "the hard part."
+        )
 
     growth = math.ceil(math.log2(max(num_taps, 2)))
     acc_bits = data_bits + q.fmt.total_bits + growth

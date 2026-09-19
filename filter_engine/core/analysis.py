@@ -148,26 +148,40 @@ class Measurements:
 def frequency_response(
     fd: FilterDesign,
     num_points: int = 4096,
-    f_min: float = 0.0,
+    f_min: float | None = None,
     f_max: float | None = None,
     log_spacing: bool = False,
+    two_sided: bool | None = None,
 ) -> FrequencyResponse:
     """Evaluate H(f) on ``num_points`` frequencies between ``f_min`` and ``f_max``.
 
     ``f_max`` defaults to Nyquist.  Log spacing starts at ``f_min`` or, if that
     is zero, at Nyquist/1e5 -- you cannot put DC on a log axis.
+
+    A filter with complex taps is evaluated two-sided by default, from
+    -Nyquist to +Nyquist. Its response is *not* symmetric about DC -- that
+    asymmetry is the whole point of a complex filter -- so showing only the
+    positive half would hide half of what it does.
     """
     fs = fd.sample_rate
     nyq = fs / 2.0
+    if two_sided is None:
+        two_sided = fd.is_complex
+    if f_min is None:
+        f_min = -nyq if two_sided else 0.0
     if f_max is None:
         f_max = nyq
     f_max = min(f_max, nyq)
+    f_min = max(f_min, -nyq)
 
     if log_spacing:
         lo = f_min if f_min > 0 else nyq / 1e5
         freqs = np.logspace(math.log10(lo), math.log10(f_max), num_points)
     else:
         freqs = np.linspace(f_min, f_max, num_points)
+
+    # freqz evaluates on exp(-j*2*pi*f/fs), which is perfectly well defined
+    # for negative f -- it is the same unit circle traversed the other way.
 
     with _quiet_bad_coefficients():
         if fd.sos is not None:

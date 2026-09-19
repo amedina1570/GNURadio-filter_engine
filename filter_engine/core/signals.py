@@ -4,7 +4,7 @@ Plots of H(f) tell you what a filter does to a steady sinusoid.  They do not
 tell you what it does to a *pulse* -- how much the edges ring, how far the
 envelope smears, how a chirp comes out the other side.  This module generates
 excitations with the parameters an SDR or radar user actually thinks in
-(width, PRF, carrier offset, SNR) and runs them through a design.
+(width, PRI, carrier offset, SNR) and runs them through a design.
 
 Signals may be real or complex.  Complex baseband is the default whenever a
 carrier offset is requested, because that is how an SDR front end presents
@@ -49,10 +49,23 @@ class PulseKind(str, Enum):
     PRBS_BPSK = "prbs_bpsk"
     TWO_TONE = "two_tone"
     AWGN = "awgn"
+    #: The complex LFM pulse a radar actually transmits.
+    LFM_PULSE = "lfm_pulse"
+    #: Two LFM echoes at different ranges and very different strengths -- the
+    #: case that decides whether a weighting was worth applying.
+    TWO_TARGETS = "two_targets"
 
     @property
     def label(self) -> str:
+        if self is PulseKind.LFM_PULSE:
+            return "LFM pulse (radar)"
+        if self is PulseKind.TWO_TARGETS:
+            return "Two targets (radar)"
         return self.value.replace("_", " ").title()
+
+    @property
+    def is_radar(self) -> bool:
+        return self in (PulseKind.LFM_PULSE, PulseKind.TWO_TARGETS)
 
 
 @dataclass
@@ -79,8 +92,13 @@ class PulseSpec:
     #: Force complex output even at zero carrier offset.
     force_complex: bool = False
 
-    #: Pulse repetition frequency. 0 emits a single pulse.
-    prf_hz: float = 0.0
+    #: Pulse repetition interval: the time from one pulse to the next.
+    #: 0 emits a single pulse.
+    #:
+    #: Specified as an interval rather than a frequency because that is how
+    #: radar timing is actually reasoned about -- PRI sets the listening
+    #: window, and the unambiguous range is just that window times c/2.
+    pri_s: float = 0.0
 
     # --- chirp ---------------------------------------------------------------
     chirp_f0_hz: float = -100_000.0
@@ -95,11 +113,35 @@ class PulseSpec:
     symbol_rate: float = 100_000.0
     seed: int = 0
 
+    # --- radar ---------------------------------------------------------------
+    #: Swept bandwidth of the LFM echo. Match this to the filter's chirp or
+    #: the pulse will not compress.
+    lfm_bandwidth_hz: float = 10e6
+    #: Sweep direction of the LFM echo.
+    lfm_down_chirp: bool = False
+    #: Range separation of the two targets, as a delay.
+    target_separation_s: float = 2e-6
+    #: How much weaker the second target is, in dB. This is the number that
+    #: matters: if it is below the filter's peak sidelobe level, the weaker
+    #: target is buried in the stronger one's sidelobes and no amount of
+    #: integration will recover it.
+    target2_relative_db: float = -40.0
+
     # --- impairment ----------------------------------------------------------
     #: Additive white Gaussian noise level relative to the signal, in dB.
     #: ``None`` adds no noise.  For :attr:`PulseKind.AWGN` the noise *is* the
     #: signal and this is ignored.
     snr_db: float | None = None
+
+    @property
+    def prf_hz(self) -> float:
+        """Pulse repetition frequency, derived from the PRI."""
+        return 1.0 / self.pri_s if self.pri_s > 0 else 0.0
+
+    @property
+    def duty_cycle(self) -> float:
+        """Fraction of the repetition interval the pulse occupies."""
+        return self.width_s / self.pri_s if self.pri_s > 0 else 0.0
 
     @property
     def num_samples(self) -> int:
@@ -108,7 +150,9 @@ class PulseSpec:
 
     @property
     def is_complex(self) -> bool:
-        return self.force_complex or self.carrier_hz != 0.0
+        # A radar echo is always I/Q: a real chirp carries a mirror image
+        # that would compress into a second, spurious target.
+        return self.force_complex or self.carrier_hz != 0.0 or self.kind.is_radar
 
     def validate(self) -> None:
         if self.sample_rate <= 0:
@@ -134,6 +178,8 @@ class PulseSpec:
             PulseKind.RAISED_COSINE,
             PulseKind.TONE_BURST,
             PulseKind.CHIRP,
+            PulseKind.LFM_PULSE,
+            PulseKind.TWO_TARGETS,
         )
         if needs_width and self.width_s <= 0:
             raise SpecError("Pulse width must be greater than 0 s.")
@@ -143,12 +189,13 @@ class PulseSpec:
                 f"{self.width_s * self.sample_rate:.2f} samples wide. Widen the "
                 "pulse or raise the sample rate."
             )
-        if self.prf_hz < 0:
-            raise SpecError("PRF cannot be negative.")
-        if self.prf_hz > 0 and self.prf_hz * self.width_s > 1.0:
+        if self.pri_s < 0:
+            raise SpecError("PRI cannot be negative.")
+        if 0 < self.pri_s < self.width_s:
             raise SpecError(
-                "The pulse is wider than the repetition interval; lower the "
-                "PRF or narrow the pulse."
+                f"The pulse ({self.width_s * 1e6:.4g} us) is longer than the "
+                f"PRI ({self.pri_s * 1e6:.4g} us); the transmitter would never "
+                "switch off. Lengthen the PRI or narrow the pulse."
             )
         if self.kind is PulseKind.PRBS_BPSK:
             if self.symbol_rate <= 0:
@@ -156,6 +203,15 @@ class PulseSpec:
             if self.sample_rate / self.symbol_rate < 2:
                 raise SpecError(
                     "Sample rate must be at least twice the symbol rate."
+                )
+        if self.kind.is_radar:
+            if self.lfm_bandwidth_hz <= 0:
+                raise SpecError("LFM bandwidth must be greater than 0 Hz.")
+            if self.lfm_bandwidth_hz > self.sample_rate:
+                raise SpecError(
+                    f"A {self.lfm_bandwidth_hz / 1e6:.4g} MHz chirp does not "
+                    f"fit in a {self.sample_rate / 1e6:.4g} MS/s complex "
+                    "sample rate."
                 )
         if self.kind is PulseKind.TWO_TONE:
             for name, f in (("Tone 1", self.tone1_hz), ("Tone 2", self.tone2_hz)):
@@ -194,9 +250,9 @@ def generate(ps: PulseSpec) -> GeneratedSignal:
 
     envelope = _build_envelope(ps, t, notes)
 
-    # Repeat the pulse at the requested PRF.  Shape-only kinds (noise, PRBS,
+    # Repeat the pulse at the requested PRI.  Shape-only kinds (noise, PRBS,
     # two-tone) fill the record already and are not repeated.
-    if ps.prf_hz > 0 and ps.kind not in (
+    if ps.pri_s > 0 and ps.kind not in (
         PulseKind.AWGN,
         PulseKind.PRBS_BPSK,
         PulseKind.TWO_TONE,
@@ -357,6 +413,9 @@ def _build_envelope(ps: PulseSpec, t: np.ndarray, notes: list[str]) -> np.ndarra
         )
         return x
 
+    if kind in (PulseKind.LFM_PULSE, PulseKind.TWO_TARGETS):
+        return _lfm_envelope(ps, t, notes)
+
     if kind is PulseKind.AWGN:
         rng = np.random.default_rng(ps.seed)
         if ps.is_complex:
@@ -372,9 +431,61 @@ def _build_envelope(ps: PulseSpec, t: np.ndarray, notes: list[str]) -> np.ndarra
     raise SpecError(f"unsupported pulse kind {kind!r}")
 
 
+def _lfm_envelope(ps: PulseSpec, t: np.ndarray, notes: list[str]) -> np.ndarray:
+    """One or two complex LFM echoes placed in the record.
+
+    Complex, always: a radar receiver works on I/Q, and a real chirp would
+    carry a mirror image that compresses to a second, spurious target.
+    """
+    from .radar import C_LIGHT, lfm_transmit_pulse
+
+    n = t.size
+    fs = ps.sample_rate
+    pulse = lfm_transmit_pulse(fs, ps.width_s, ps.lfm_bandwidth_hz, ps.lfm_down_chirp)
+
+    out = np.zeros(n, dtype=complex)
+
+    def place(start_index: int, amplitude: float) -> bool:
+        lo = int(np.clip(start_index, 0, max(n - 1, 0)))
+        hi = min(lo + pulse.size, n)
+        if hi <= lo:
+            return False
+        out[lo:hi] += amplitude * pulse[: hi - lo]
+        return hi - lo == pulse.size
+
+    first = int(round((ps.delay_s - ps.width_s / 2.0) * fs))
+    if not place(first, 1.0):
+        notes.append(
+            "The record is too short to hold the whole pulse; it has been "
+            "truncated, which will raise the measured sidelobes."
+        )
+
+    tbp = ps.lfm_bandwidth_hz * ps.width_s
+    notes.append(
+        f"LFM echo: {ps.lfm_bandwidth_hz / 1e6:,.6g} MHz swept over "
+        f"{ps.width_s * 1e6:,.6g} us (time-bandwidth product {tbp:,.0f}). "
+        f"Range resolution {C_LIGHT / (2 * ps.lfm_bandwidth_hz):,.4g} m."
+    )
+
+    if ps.kind is PulseKind.TWO_TARGETS:
+        amplitude = 10.0 ** (ps.target2_relative_db / 20.0)
+        second = first + int(round(ps.target_separation_s * fs))
+        place(second, amplitude)
+        separation_m = ps.target_separation_s * C_LIGHT / 2.0
+        cells = ps.target_separation_s * ps.lfm_bandwidth_hz
+        notes.append(
+            f"Second target {abs(ps.target2_relative_db):.0f} dB weaker, "
+            f"{separation_m:,.4g} m further out ({cells:.1f} range cells). "
+            "It is only visible if the filter's peak sidelobe sits below "
+            f"{ps.target2_relative_db:.0f} dB."
+        )
+
+    return out
+
+
 def _repeat(envelope: np.ndarray, ps: PulseSpec, notes: list[str]) -> np.ndarray:
-    """Tile a single pulse at the requested PRF."""
-    period = int(round(ps.sample_rate / ps.prf_hz))
+    """Tile a single pulse at the requested PRI."""
+    period = int(round(ps.pri_s * ps.sample_rate))
     if period < 1:
         return envelope
     n = envelope.size
@@ -384,9 +495,13 @@ def _repeat(envelope: np.ndarray, ps: PulseSpec, notes: list[str]) -> np.ndarray
         seg = envelope[: n - start]
         out[start : start + seg.size] += seg
         count += 1
+    from .radar import unambiguous_range_m
+
     notes.append(
-        f"Repeated at {ps.prf_hz:,.6g} Hz PRF ({count} pulses, "
-        f"{ps.prf_hz * ps.width_s * 100:.2f}% duty cycle)."
+        f"Repeated every {ps.pri_s * 1e6:,.6g} us "
+        f"({ps.prf_hz:,.6g} Hz PRF, {count} pulses, "
+        f"{ps.duty_cycle * 100:.2f}% duty cycle). Unambiguous range "
+        f"{unambiguous_range_m(ps.pri_s) / 1e3:,.4g} km."
     )
     return out
 
