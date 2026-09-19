@@ -12,6 +12,8 @@ gets ignored.
 
 from __future__ import annotations
 
+import math
+
 from ...core.spec import (
     NORMALISATIONS,
     WINDOWS,
@@ -22,23 +24,31 @@ from ...core.spec import (
     FilterSpec,
     SpecError,
 )
+from ...core.explain import describe, help_for
+from ...core.radar import get_weighting, minimum_taylor_nbar
 from ...presets import FILTER_PRESETS, SDR_PLATFORMS
-from ..qt import QtWidgets, Signal
+from ..qt import Qt, QtWidgets, Signal
 from ..widgets.fields import FrequencyEdit, LabelledRow, combo_enum, select_data
 
 __all__ = ["DesignPanel"]
 
 #: Friendly names for the response types, in the order they appear.
-_RESPONSE_LABELS = [
-    (Response.LOWPASS, "Low pass"),
-    (Response.HIGHPASS, "High pass"),
-    (Response.BANDPASS, "Band pass"),
-    (Response.BANDSTOP, "Band stop"),
-    (Response.HILBERT, "Hilbert transformer"),
-    (Response.DIFFERENTIATOR, "Differentiator"),
-    (Response.RRC, "Root raised cosine"),
-    (Response.RC, "Raised cosine"),
-    (Response.GAUSSIAN, "Gaussian"),
+#: Responses in menu order, grouped by what they are for. The group headings
+#: are inserted as disabled separator items, so a user scanning the list sees
+#: the radar filters as a set rather than as five more entries in a long list.
+_RESPONSE_GROUPS: list[tuple[str, list[Response]]] = [
+    (
+        "Frequency selective",
+        [
+            Response.LOWPASS,
+            Response.HIGHPASS,
+            Response.BANDPASS,
+            Response.BANDSTOP,
+        ],
+    ),
+    ("Specialised", [Response.HILBERT, Response.DIFFERENTIATOR]),
+    ("Pulse shaping (data links)", [Response.RRC, Response.RC, Response.GAUSSIAN]),
+    ("Radar", [Response.MATCHED_LFM, Response.MTI_CANCELLER]),
 ]
 
 _FIR_METHOD_LABELS = [
@@ -63,7 +73,45 @@ _FIR_ONLY = {
     Response.RRC,
     Response.RC,
     Response.GAUSSIAN,
+    Response.MATCHED_LFM,
+    Response.MTI_CANCELLER,
 }
+
+#: Weightings offered for the radar responses, in the order they appear.
+_WEIGHTING_ORDER = (
+    "boxcar",
+    "hann",
+    "hamming",
+    "blackman",
+    "blackmanharris",
+    "taylor",
+    "chebwin",
+    "kaiser",
+)
+
+
+def _tip(widget: QtWidgets.QWidget, field: str) -> QtWidgets.QWidget:
+    """Attach the plain-language explanation of ``field`` to ``widget``.
+
+    Help text lives in :mod:`filter_engine.core.explain` rather than inline
+    here, so it can be reviewed as prose and tested for coverage.
+    """
+    text = help_for(field)
+    if text:
+        widget.setToolTip(text)
+    return widget
+
+
+def _spin(
+    value: float, low: float, high: float, decimals: int, suffix: str = ""
+) -> QtWidgets.QDoubleSpinBox:
+    spin = QtWidgets.QDoubleSpinBox()
+    spin.setRange(low, high)
+    spin.setDecimals(decimals)
+    spin.setValue(value)
+    if suffix:
+        spin.setSuffix(suffix)
+    return spin
 
 
 class DesignPanel(QtWidgets.QWidget):
@@ -96,11 +144,140 @@ class DesignPanel(QtWidgets.QWidget):
 
         layout.addWidget(self._build_preset_group())
         layout.addWidget(self._build_type_group())
+        layout.addWidget(self._build_explanation())
         layout.addWidget(self._build_frequency_group())
+        layout.addWidget(self._build_radar_group())
+        layout.addWidget(self._build_weighting_group())
         layout.addWidget(self._build_tolerance_group())
         layout.addWidget(self._build_order_group())
         layout.addWidget(self._build_pulse_group())
         layout.addStretch(1)
+
+        # Pinned below the scroll area, not inside it. This is the panel's
+        # answer to "so what does that actually give me?", and it is no use
+        # if you have to scroll past every parameter to reach it.
+        outer.addWidget(self._build_derived_group())
+
+    def _build_explanation(self) -> QtWidgets.QWidget:
+        """A banner saying, in plain words, what the chosen response does."""
+        box = QtWidgets.QGroupBox("What this filter does")
+        self.explanation_box = box
+        layout = QtWidgets.QVBoxLayout(box)
+
+        self.summary_label = QtWidgets.QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.summary_label)
+
+        self.detail_label = QtWidgets.QLabel()
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+        return box
+
+    def _build_radar_group(self) -> QtWidgets.QWidget:
+        """Pulse compression and MTI parameters, in radar's own units."""
+        box = QtWidgets.QGroupBox("Radar")
+        self.radar_group = box
+        form = QtWidgets.QFormLayout(box)
+
+        self.pulse_width_spin = _spin(10.0, 0.001, 1e6, 4, " us")
+        self.pulse_width_spin.valueChanged.connect(self._emit)
+        _tip(self.pulse_width_spin, "pulse_width_s")
+        self.pulse_width_row = LabelledRow(form, "Pulse width", self.pulse_width_spin)
+
+        self.chirp_bw_edit = FrequencyEdit(10e6)
+        self.chirp_bw_edit.valueChanged.connect(self._emit)
+        _tip(self.chirp_bw_edit, "chirp_bandwidth_hz")
+        self.chirp_bw_row = LabelledRow(form, "Chirp bandwidth", self.chirp_bw_edit)
+
+        self.down_chirp_check = QtWidgets.QCheckBox("Sweep downwards")
+        self.down_chirp_check.toggled.connect(self._emit)
+        _tip(self.down_chirp_check, "down_chirp")
+        self.down_chirp_row = LabelledRow(form, "", self.down_chirp_check)
+
+        self.pri_spin = _spin(1000.0, 0.001, 1e9, 4, " us")
+        self.pri_spin.valueChanged.connect(self._on_pri)
+        _tip(self.pri_spin, "pri_s")
+        self.pri_row = LabelledRow(form, "PRI", self.pri_spin)
+
+        self.prf_label = QtWidgets.QLabel()
+        self.prf_label.setStyleSheet("font-style: italic;")
+        form.addRow("", self.prf_label)
+
+        self.mti_spin = QtWidgets.QSpinBox()
+        self.mti_spin.setRange(2, 5)
+        self.mti_spin.setSuffix(" pulses")
+        self.mti_spin.valueChanged.connect(self._emit)
+        _tip(self.mti_spin, "mti_pulses")
+        self.mti_row = LabelledRow(form, "Canceller", self.mti_spin)
+
+        self.carrier_edit = FrequencyEdit(10e9)
+        self.carrier_edit.valueChanged.connect(self._emit)
+        _tip(self.carrier_edit, "radar_carrier_hz")
+        self.carrier_row = LabelledRow(form, "Carrier", self.carrier_edit)
+        return box
+
+    def _build_weighting_group(self) -> QtWidgets.QWidget:
+        """The taper and its parameters, for the radar responses."""
+        box = QtWidgets.QGroupBox("Weighting (range sidelobe control)")
+        self.weighting_group = box
+        form = QtWidgets.QFormLayout(box)
+
+        self.weighting_combo = QtWidgets.QComboBox()
+        for name in _WEIGHTING_ORDER:
+            weighting = get_weighting(name)
+            label = weighting.label if weighting else name
+            if weighting and weighting.pslr_db is not None:
+                label += f"  ({weighting.pslr_db:.0f} dB sidelobes)"
+            self.weighting_combo.addItem(label, name)
+        self.weighting_combo.currentIndexChanged.connect(self._on_weighting)
+        form.addRow("Taper", self.weighting_combo)
+
+        self.weighting_help = QtWidgets.QLabel()
+        self.weighting_help.setWordWrap(True)
+        self.weighting_help.setStyleSheet("font-style: italic;")
+        form.addRow("", self.weighting_help)
+
+        self.sll_spin = _spin(35.0, 10.0, 120.0, 1, " dB")
+        self.sll_spin.valueChanged.connect(self._on_sll)
+        _tip(self.sll_spin, "taylor_sll_db")
+        self.sll_row = LabelledRow(form, "Sidelobe level", self.sll_spin)
+
+        self.auto_nbar_check = QtWidgets.QCheckBox("Derive from the level")
+        self.auto_nbar_check.setChecked(True)
+        self.auto_nbar_check.toggled.connect(self._on_auto_nbar)
+        _tip(self.auto_nbar_check, "auto_taylor_nbar")
+        self.auto_nbar_row = LabelledRow(form, "", self.auto_nbar_check)
+
+        self.nbar_spin = QtWidgets.QSpinBox()
+        self.nbar_spin.setRange(1, 40)
+        self.nbar_spin.setValue(4)
+        self.nbar_spin.valueChanged.connect(self._emit)
+        _tip(self.nbar_spin, "taylor_nbar")
+        self.nbar_row = LabelledRow(form, "Flat sidelobes (nbar)", self.nbar_spin)
+
+        self.cheb_spin = _spin(60.0, 20.0, 150.0, 1, " dB")
+        self.cheb_spin.valueChanged.connect(self._emit)
+        _tip(self.cheb_spin, "cheb_atten_db")
+        self.cheb_row = LabelledRow(form, "Sidelobe level", self.cheb_spin)
+        return box
+
+    def _build_derived_group(self) -> QtWidgets.QWidget:
+        """Read-only consequences of the settings above.
+
+        The point of this panel: a user sets bandwidth in hertz but thinks in
+        metres of resolution, and sets a PRI in microseconds but cares about
+        how far away an unambiguous target can be. Showing both means nobody
+        has to keep c/2 in their head.
+        """
+        box = QtWidgets.QGroupBox("What that gives you")
+        self.derived_group = box
+        layout = QtWidgets.QVBoxLayout(box)
+        self.derived_label = QtWidgets.QLabel()
+        self.derived_label.setWordWrap(True)
+        self.derived_label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.derived_label)
+        return box
 
     def _build_preset_group(self) -> QtWidgets.QWidget:
         box = QtWidgets.QGroupBox("Start from")
@@ -133,8 +310,16 @@ class DesignPanel(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout(box)
 
         self.response_combo = QtWidgets.QComboBox()
-        for response, label in _RESPONSE_LABELS:
-            self.response_combo.addItem(label, response)
+        model = self.response_combo.model()
+        for heading, responses in _RESPONSE_GROUPS:
+            self.response_combo.addItem(f"--- {heading} ---", None)
+            item = model.item(self.response_combo.count() - 1)
+            if item is not None:
+                item.setEnabled(False)
+            for response in responses:
+                self.response_combo.addItem(
+                    "   " + describe(response).label, response
+                )
         self.response_combo.currentIndexChanged.connect(self._on_response)
         form.addRow("Response", self.response_combo)
 
@@ -319,8 +504,18 @@ class DesignPanel(QtWidgets.QWidget):
             auto_order=self.auto_check.isChecked(),
             num_taps=self.taps_spin.value(),
             order=self.order_spin.value(),
-            window=str(self.window_combo.currentData()),
+            window=self._current_window(),
             window_param=self.beta_spin.value(),
+            taylor_sll_db=self.sll_spin.value(),
+            taylor_nbar=self.nbar_spin.value(),
+            auto_taylor_nbar=self.auto_nbar_check.isChecked(),
+            cheb_atten_db=self.cheb_spin.value(),
+            pulse_width_s=self.pulse_width_spin.value() * 1e-6,
+            chirp_bandwidth_hz=self.chirp_bw_edit.value(),
+            down_chirp=self.down_chirp_check.isChecked(),
+            pri_s=self.pri_spin.value() * 1e-6,
+            mti_pulses=self.mti_spin.value(),
+            radar_carrier_hz=self.carrier_edit.value(),
             symbol_rate=self.symrate_edit.value(),
             rolloff=self.rolloff_spin.value(),
             bt=self.bt_spin.value(),
@@ -372,7 +567,18 @@ class DesignPanel(QtWidgets.QWidget):
             self.taps_spin.setValue(spec.num_taps)
             self.order_spin.setValue(spec.order)
             select_data(self.window_combo, spec.window)
+            select_data(self.weighting_combo, spec.window)
             self.beta_spin.setValue(spec.window_param)
+            self.sll_spin.setValue(spec.taylor_sll_db)
+            self.nbar_spin.setValue(spec.taylor_nbar)
+            self.auto_nbar_check.setChecked(spec.auto_taylor_nbar)
+            self.cheb_spin.setValue(spec.cheb_atten_db)
+            self.pulse_width_spin.setValue(spec.pulse_width_s * 1e6)
+            self.chirp_bw_edit.setValue(spec.chirp_bandwidth_hz)
+            self.down_chirp_check.setChecked(spec.down_chirp)
+            self.pri_spin.setValue(spec.pri_s * 1e6)
+            self.mti_spin.setValue(spec.mti_pulses)
+            self.carrier_edit.setValue(spec.radar_carrier_hz)
             self.symrate_edit.setValue(spec.symbol_rate)
             self.rolloff_spin.setValue(spec.rolloff)
             self.bt_spin.setValue(spec.bt)
@@ -449,6 +655,37 @@ class DesignPanel(QtWidgets.QWidget):
         self._update_visibility()
         self._emit()
 
+    def _current_window(self) -> str:
+        """The weighting in force: radar uses its own combo, others the window one."""
+        if self._response().is_radar:
+            return str(self.weighting_combo.currentData())
+        return str(self.window_combo.currentData())
+
+    def _on_weighting(self) -> None:
+        self._update_visibility()
+        self._emit()
+
+    def _on_sll(self, _value: float = 0.0) -> None:
+        self._update_visibility()
+        self._emit()
+
+    def _on_auto_nbar(self, _checked: bool = False) -> None:
+        self._update_visibility()
+        self._emit()
+
+    def _on_pri(self, _value: float = 0.0) -> None:
+        # For an MTI canceller the sample rate is the PRF by definition, so
+        # editing the PRI has to move it. Leaving them independent would let a
+        # user produce a filter whose Doppler axis means nothing.
+        if self._response() is Response.MTI_CANCELLER:
+            pri = self.pri_spin.value() * 1e-6
+            if pri > 0:
+                blocked = self.fs_edit.blockSignals(True)
+                self.fs_edit.setValue(1.0 / pri)
+                self.fs_edit.blockSignals(blocked)
+        self._update_labels()
+        self._emit()
+
     def _on_stopband(self, _value: float = 0.0) -> None:
         self._update_visibility()
         self._emit()
@@ -476,6 +713,15 @@ class DesignPanel(QtWidgets.QWidget):
             self.platform_warning.setText(message or "")
             self.platform_warning.setVisible(bool(message))
 
+        info = describe(self._response())
+        self.summary_label.setText(info.summary)
+        self.detail_label.setText(info.detail)
+
+        pri = self.pri_spin.value() * 1e-6
+        if pri > 0:
+            self.prf_label.setText(f"= {1.0 / pri:,.6g} Hz PRF")
+        self._update_derived()
+
     def _sync_kaiser_beta(self, auto: bool) -> None:
         """Show the beta the design will really use, and lock it when derived."""
         from ...core.firdes import kaiser_beta_for_atten
@@ -497,21 +743,169 @@ class DesignPanel(QtWidgets.QWidget):
                 "Higher beta means a deeper stopband and a wider transition."
             )
 
+    def _sync_weighting_rows(self) -> None:
+        """Show only the parameters the chosen taper actually uses."""
+        name = self._current_window()
+        is_taylor = name == "taylor"
+        is_cheb = name == "chebwin"
+        is_kaiser = name == "kaiser"
+
+        self.sll_row.setVisible(is_taylor)
+        self.auto_nbar_row.setVisible(is_taylor)
+        self.nbar_row.setVisible(is_taylor)
+        self.cheb_row.setVisible(is_cheb)
+        self.beta_row.setVisible(is_kaiser)
+
+        if not is_taylor:
+            return
+
+        # nbar and the sidelobe level are coupled: too small an nbar cannot
+        # hold a deep level, and the shortfall is silent. Derive it by default
+        # and warn when an override falls short.
+        auto = self.auto_nbar_check.isChecked()
+        recommended = minimum_taylor_nbar(self.sll_spin.value())
+        self.nbar_spin.setEnabled(not auto)
+        if auto:
+            blocked = self.nbar_spin.blockSignals(True)
+            self.nbar_spin.setValue(recommended)
+            self.nbar_spin.blockSignals(blocked)
+            self.nbar_row.label.setText("Flat sidelobes (derived)")
+            self.nbar_spin.setToolTip(
+                f"{recommended} is the smallest nbar that can hold "
+                f"{self.sll_spin.value():.0f} dB. Untick to choose your own."
+            )
+        else:
+            self.nbar_row.label.setText("Flat sidelobes (nbar)")
+            if self.nbar_spin.value() < recommended:
+                self.nbar_spin.setToolTip(
+                    f"{self.nbar_spin.value()} is too few for "
+                    f"{self.sll_spin.value():.0f} dB: Taylor needs at least "
+                    f"{recommended}, and below that the realised sidelobes sit "
+                    "several dB above the level you asked for."
+                )
+            else:
+                _tip(self.nbar_spin, "taylor_nbar")
+
+    def _update_derived(self) -> None:
+        """Restate the settings as the quantities a user actually cares about.
+
+        Somebody types a bandwidth in hertz but thinks in metres of
+        resolution, and a PRI in microseconds but cares how far away a target
+        can be before it folds. Showing both means nobody has to keep c/2 in
+        their head while they work.
+        """
+        try:
+            spec = self.spec()
+        except (SpecError, TypeError):
+            return
+
+        rows: list[str] = []
+        response = spec.response
+
+        if response is Response.MATCHED_LFM:
+            tbp = spec.time_bandwidth_product
+            # Forced odd, exactly as the designer does it, so this figure and
+            # the status bar cannot disagree by one.
+            from ...core.radar import lfm_length
+
+            taps = lfm_length(spec.sample_rate, spec.pulse_width_s)
+            rows += [
+                f"Range resolution: <b>{spec.range_resolution_m:,.4g} m</b>"
+                " &mdash; set by the chirp bandwidth alone",
+                f"Compression ratio: <b>{tbp:,.0f}:1</b>, giving "
+                f"<b>{10 * math.log10(max(tbp, 1e-9)):.1f} dB</b> of "
+                "processing gain",
+                f"Filter length: <b>{taps:,}</b> complex taps",
+                f"Unambiguous range: <b>{spec.unambiguous_range_m / 1e3:,.4g} km</b>",
+                f"Duty cycle: <b>{spec.duty_cycle * 100:.2f}%</b>",
+            ]
+            if spec.window == "taylor":
+                rows.append(
+                    f"Designed sidelobes: <b>-{spec.taylor_sll_db:.0f} dB</b>, "
+                    f"nbar {spec.effective_taylor_nbar}"
+                )
+        elif response is Response.MTI_CANCELLER:
+            rows += [
+                f"PRF: <b>{spec.prf_hz:,.6g} Hz</b>, one sample every "
+                f"{spec.pri_s * 1e6:,.4g} us",
+                f"Unambiguous range: <b>{spec.unambiguous_range_m / 1e3:,.4g} km</b>",
+                f"First blind speed: <b>{spec.blind_speed_ms:,.4g} m/s</b>"
+                " &mdash; and every multiple of it",
+                "Unambiguous velocity: <b>&plusmn;"
+                f"{spec.unambiguous_velocity_ms / 2:,.4g} m/s</b>",
+                f"Clutter notch order: <b>{spec.mti_pulses - 1}</b>",
+            ]
+        elif response.is_pulse_shaping:
+            rows += [
+                f"Samples per symbol: <b>{spec.samples_per_symbol:.4g}</b>",
+                f"Symbol period: <b>{1e6 / spec.symbol_rate:,.4g} us</b>",
+            ]
+            if response in (Response.RRC, Response.RC):
+                occupied = spec.symbol_rate * (1 + spec.rolloff)
+                rows.append(
+                    f"Occupied bandwidth: <b>{occupied / 1e6:,.4g} MHz</b>"
+                    f" ({spec.rolloff:.0%} excess)"
+                )
+        else:
+            nyq = spec.nyquist
+            rows.append(f"Nyquist frequency: <b>{nyq / 1e6:,.6g} MHz</b>")
+            if not response.is_multiband:
+                rows.append(
+                    f"Cutoff sits at <b>{100 * spec.f_low / nyq:.1f}%</b> of Nyquist"
+                )
+            rows.append(
+                f"Transition is <b>{100 * spec.transition_width / nyq:.2f}%</b>"
+                " of Nyquist &mdash; narrower costs taps"
+            )
+
+        self.derived_label.setText("<br>".join(rows))
+
     def _update_visibility(self) -> None:
         response = self._response()
         family = self._family()
         is_pulse = response.is_pulse_shaping
+        is_radar = response.is_radar
+        is_lfm = response is Response.MATCHED_LFM
+        is_mti = response is Response.MTI_CANCELLER
         is_fir = family is FilterFamily.FIR
         auto = self.auto_check.isChecked()
 
         self.pulse_group.setVisible(is_pulse)
+        self.radar_group.setVisible(is_radar)
+        self.weighting_group.setVisible(is_lfm)
+        self.derived_group.setVisible(True)
+
+        # --- radar rows ---------------------------------------------------
+        self.pulse_width_row.setVisible(is_lfm)
+        self.chirp_bw_row.setVisible(is_lfm)
+        self.down_chirp_row.setVisible(is_lfm)
+        self.pri_row.setVisible(is_radar)
+        self.prf_label.setVisible(is_radar)
+        self.mti_row.setVisible(is_mti)
+        self.carrier_row.setVisible(is_radar)
+        # An MTI canceller runs in slow time, so its sample rate is the PRF
+        # and is not the user's to set independently.
+        self.fs_edit.setEnabled(not is_mti)
+        self.fs_edit.setToolTip(
+            "Fixed at the PRF: this filter takes one sample per pulse."
+            if is_mti
+            else help_for("sample_rate")
+        )
+
+        if is_lfm:
+            weighting = get_weighting(self._current_window())
+            self.weighting_help.setText(weighting.description if weighting else "")
+            self._sync_weighting_rows()
 
         # Band edges
         self.flow_row.setVisible(
-            not is_pulse and response is not Response.DIFFERENTIATOR
+            not is_pulse
+            and not is_radar
+            and response is not Response.DIFFERENTIATOR
         )
         self.fhigh_row.setVisible(
             not is_pulse
+            and not is_radar
             and (response.is_multiband or response is Response.DIFFERENTIATOR)
         )
         if response is Response.DIFFERENTIATOR:
@@ -524,9 +918,10 @@ class DesignPanel(QtWidgets.QWidget):
 
         # A Hilbert transformer has no transition band, and pulse shapes are
         # defined by roll-off rather than by a transition width.
-        needs_transition = not is_pulse and response not in (
-            Response.HILBERT,
-            Response.DIFFERENTIATOR,
+        needs_transition = (
+            not is_pulse
+            and not is_radar
+            and response not in (Response.HILBERT, Response.DIFFERENTIATOR)
         )
         self.tw_row.setVisible(needs_transition)
         self.ripple_row.setVisible(needs_transition)
@@ -536,6 +931,7 @@ class DesignPanel(QtWidgets.QWidget):
         windowed = (
             is_fir
             and not is_pulse
+            and not is_radar
             and self._current_fir_method() is FirMethod.WINDOW
             and response is not Response.DIFFERENTIATOR
         )
@@ -550,12 +946,17 @@ class DesignPanel(QtWidgets.QWidget):
         # actually used and lock the field.
         if is_kaiser and windowed:
             self._sync_kaiser_beta(auto)
-        self.method_combo.setEnabled(not is_pulse and response is not Response.HILBERT)
+        self.method_combo.setEnabled(
+            not is_pulse and not is_radar and response is not Response.HILBERT
+        )
 
-        # Order
-        self.auto_check.setVisible(not is_pulse)
-        self.taps_row.setVisible(not is_pulse and is_fir and not auto)
-        self.order_row.setVisible(not is_pulse and not is_fir and not auto)
+        # Order. A radar filter's length follows from the pulse, so there is
+        # nothing left to choose.
+        self.auto_check.setVisible(not is_pulse and not is_radar)
+        self.taps_row.setVisible(not is_pulse and not is_radar and is_fir and not auto)
+        self.order_row.setVisible(
+            not is_pulse and not is_radar and not is_fir and not auto
+        )
 
         # Roll-off versus BT product
         self.rolloff_row.setVisible(response in (Response.RRC, Response.RC))

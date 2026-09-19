@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import traceback
 
+import numpy as np
+
 from ..core.design import DesignError, FilterDesign, design
 from ..core.analysis import measure
 from ..core.spec import FilterSpec, SpecError
@@ -28,6 +30,7 @@ __all__ = ["MainWindow", "main"]
 
 #: How long to wait after the last edit before redesigning, in milliseconds.
 REDESIGN_DELAY_MS = 120
+
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -61,8 +64,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(splitter)
 
         self.design_panel = DesignPanel()
-        self.design_panel.setMinimumWidth(320)
-        self.design_panel.setMaximumWidth(460)
+        self.design_panel.setMinimumWidth(400)
+        self.design_panel.setMaximumWidth(620)
         splitter.addWidget(self.design_panel)
 
         right = QtWidgets.QWidget()
@@ -82,7 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([380, 1060])
+        splitter.setSizes([470, 1060])
 
         self._build_status_bar()
         self._build_menus()
@@ -113,6 +116,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_tabs = QtWidgets.QTabWidget()
         self.plot_tabs.setDocumentMode(True)
         self.canvases: dict[str, PlotCanvas] = {}
+        self._tab_index: dict[str, int] = {}
+        # Radar plots stay in the list for every design and are simply
+        # disabled when they do not apply: greyed out tells a user the tool
+        # can do it, where a vanishing tab just looks like a different program.
         for label, draw in (
             ("Magnitude", self._draw_magnitude),
             ("Phase", self._draw_phase),
@@ -121,13 +128,50 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Step", self._draw_step),
             ("Poles && zeros", self._draw_pole_zero),
             ("Coefficients", self._draw_taps),
+            ("Compressed pulse", self._draw_compressed),
+            ("Weighting", self._draw_weighting),
+            ("Ambiguity", self._draw_ambiguity),
+            ("MTI velocity", self._draw_mti),
             ("Overview", self._draw_overview),
         ):
             canvas = PlotCanvas(draw)
             self.canvases[label] = canvas
-            self.plot_tabs.addTab(canvas, label)
+            self._tab_index[label] = self.plot_tabs.addTab(canvas, label)
         layout.addWidget(self.plot_tabs)
         return panel
+
+    #: Which plot tabs apply to which responses.
+    _LFM_ONLY = ("Compressed pulse", "Weighting", "Ambiguity")
+    _MTI_ONLY = ("MTI velocity",)
+
+    def _update_tab_availability(self) -> None:
+        """Enable the plots that mean something for the current design."""
+        from ..core.spec import Response
+
+        response = self._design.spec.response if self._design else None
+        is_lfm = response is Response.MATCHED_LFM
+        is_mti = response is Response.MTI_CANCELLER
+
+        for label, index in self._tab_index.items():
+            if label in self._LFM_ONLY:
+                enabled = is_lfm
+                reason = "Pulse compression designs only."
+            elif label in self._MTI_ONLY:
+                enabled = is_mti
+                reason = "MTI canceller designs only."
+            else:
+                enabled, reason = True, ""
+            self.plot_tabs.setTabEnabled(index, enabled)
+            self.plot_tabs.setTabToolTip(index, "" if enabled else reason)
+
+        # Land on the plot that matters when switching into a radar design.
+        current = self.plot_tabs.currentIndex()
+        if not self.plot_tabs.isTabEnabled(current):
+            self.plot_tabs.setCurrentIndex(0)
+        elif is_lfm and current == 0:
+            self.plot_tabs.setCurrentIndex(self._tab_index["Compressed pulse"])
+        elif is_mti and current == 0:
+            self.plot_tabs.setCurrentIndex(self._tab_index["MTI velocity"])
 
     def _build_status_bar(self) -> None:
         self.status = self.statusBar()
@@ -221,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fixed_point_panel.setDesign(self._design)
         self.pulse_panel.setDesign(self._design)
         self.code_panel.setDesign(self._design)
+        self._update_tab_availability()
         self._invalidate_plots()
 
     def _on_quantized(self, _quantized) -> None:
@@ -247,16 +292,32 @@ class MainWindow(QtWidgets.QMainWindow):
             if not fd.is_stable:
                 headline += "  UNSTABLE"
         spec = fd.spec
-        self.summary_label.setText(
-            f"{spec.response.value} / {spec.family.value.upper()} / "
-            f"{spec.method} - {headline}"
-        )
+        from ..core.explain import describe
+        from ..core.spec import Response
+
+        label = describe(spec.response).label
+        if spec.response is Response.MATCHED_LFM:
+            # "window" as the design method means nothing here; what matters
+            # is the taper and the bandwidth that sets resolution.
+            detail = (
+                f"{spec.chirp_bandwidth_hz / 1e6:,.6g} MHz chirp, "
+                f"{spec.window} weighting"
+            )
+        elif spec.response is Response.MTI_CANCELLER:
+            detail = f"{spec.mti_pulses} pulses at {spec.prf_hz:,.6g} Hz PRF"
+        else:
+            detail = f"{spec.family.value.upper()} / {spec.method}"
+        self.summary_label.setText(f"{label} - {detail} - {headline}")
 
         try:
             measured = measure(fd, num_points=4096)
         except Exception:
             self.measure_label.setText("")
             self.detail_text.setPlainText(fd.summary())
+            return
+
+        if spec.response.is_radar:
+            self._show_radar_measurements(fd)
             return
 
         parts = []
@@ -279,6 +340,47 @@ class MainWindow(QtWidgets.QMainWindow):
         if measured.notes:
             detail.append("")
             detail.extend(f"  {n}" for n in measured.notes)
+        self.detail_text.setPlainText("\n".join(detail))
+
+    def _show_radar_measurements(self, fd: FilterDesign) -> None:
+        """Status line and notes in the figures a radar engineer reads."""
+        from ..core.analysis import radar_metrics
+        from ..core.spec import Response
+
+        try:
+            metrics = radar_metrics(fd)
+        except Exception:
+            self.measure_label.setText("")
+            self.detail_text.setPlainText(fd.summary())
+            return
+
+        parts: list[str] = []
+        if fd.spec.response is Response.MATCHED_LFM:
+            if np.isfinite(metrics.pslr_db):
+                parts.append(f"PSLR {metrics.pslr_db:.1f} dB")
+            if np.isfinite(metrics.islr_db):
+                parts.append(f"ISLR {metrics.islr_db:.1f} dB")
+            if np.isfinite(metrics.mainlobe_3db_m):
+                parts.append(f"resolution {metrics.mainlobe_3db_m:,.3g} m")
+            if np.isfinite(metrics.weighting_loss_db):
+                parts.append(f"loss {metrics.weighting_loss_db:.2f} dB")
+        else:
+            parts.append(f"blind speeds every {fd.spec.blind_speed_ms:,.4g} m/s")
+            parts.append(
+                f"unambiguous to {fd.spec.unambiguous_range_m / 1e3:,.4g} km"
+            )
+
+        self.measure_label.setText("   ".join(parts))
+        self.measure_label.setStyleSheet("")
+
+        detail = [fd.summary(), ""]
+        rows = metrics.as_rows()
+        if rows:
+            detail.append("Measured:")
+            detail.extend(f"  {k}: {v}" for k, v in rows)
+        if metrics.notes:
+            detail.append("")
+            detail.extend(f"  {n}" for n in metrics.notes)
         self.detail_text.setPlainText("\n".join(detail))
 
     # ------------------------------------------------------------------ plots
@@ -328,6 +430,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._design is None:
             return _no_design(figure)
         plotting.plot_taps(figure, self._design, self._quantized_for_plot())
+
+    def _draw_compressed(self, figure) -> None:
+        if self._design is None:
+            return _no_design(figure)
+        plotting.plot_compressed_pulse(figure, self._design)
+
+    def _draw_weighting(self, figure) -> None:
+        if self._design is None:
+            return _no_design(figure)
+        plotting.plot_weighting(figure, self._design)
+
+    def _draw_ambiguity(self, figure) -> None:
+        if self._design is None:
+            return _no_design(figure)
+        plotting.plot_ambiguity(figure, self._design)
+
+    def _draw_mti(self, figure) -> None:
+        if self._design is None:
+            return _no_design(figure)
+        plotting.plot_mti_velocity(figure, self._design)
 
     def _draw_overview(self, figure) -> None:
         if self._design is None:

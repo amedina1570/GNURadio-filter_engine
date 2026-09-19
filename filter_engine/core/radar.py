@@ -36,6 +36,7 @@ __all__ = [
     "WEIGHTINGS",
     "weighting_window",
     "minimum_taylor_nbar",
+    "lfm_length",
 ]
 
 #: Speed of light in vacuum, m/s.
@@ -253,7 +254,7 @@ def lfm_transmit_pulse(
     flatters a Taylor-weighted design by more than 10 dB and would report
     sidelobes the hardware will never deliver.
     """
-    ntaps = _lfm_length(sample_rate, pulse_width_s)
+    ntaps = lfm_length(sample_rate, pulse_width_s)
     t = (np.arange(ntaps) - (ntaps - 1) / 2.0) / sample_rate
     chirp_rate = bandwidth_hz / pulse_width_s
     if down_chirp:
@@ -261,7 +262,12 @@ def lfm_transmit_pulse(
     return np.exp(1j * np.pi * chirp_rate * t**2)
 
 
-def _lfm_length(sample_rate: float, pulse_width_s: float) -> int:
+def lfm_length(sample_rate: float, pulse_width_s: float) -> int:
+    """Tap count for an LFM matched filter, forced odd.
+
+    Public because the GUI reports it before the design runs, and a figure
+    that disagreed with the real one by a tap would be its own small bug.
+    """
     ntaps = int(round(pulse_width_s * sample_rate))
     if ntaps % 2 == 0:
         ntaps += 1
@@ -304,7 +310,7 @@ def lfm_matched_filter(
     if bandwidth_hz <= 0:
         raise ValueError("chirp bandwidth must be > 0")
 
-    ntaps = _lfm_length(sample_rate, pulse_width_s)
+    ntaps = lfm_length(sample_rate, pulse_width_s)
     # The matched filter is the conjugate of the transmitted pulse. Because
     # t^2 is even, time-reversing it changes nothing, so this is the same
     # chirp sweeping the other way.

@@ -230,6 +230,22 @@ def plot_impulse(
 ) -> None:
     ax = fig.add_subplot(111)
     n, h = analysis.impulse_response(fd)
+
+    if np.iscomplexobj(h):
+        # matplotlib would quietly plot the real part alone, which for a
+        # chirp looks like a plain modulated pulse and hides the quadrature
+        # half entirely.
+        ax.plot(n, np.real(h), linewidth=0.9, alpha=0.75, label="I")
+        ax.plot(n, np.imag(h), linewidth=0.9, alpha=0.75, label="Q")
+        ax.plot(n, np.abs(h), linewidth=1.5, color="k", alpha=0.7,
+                label="envelope")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.set_xlabel("Sample")
+        ax.set_ylabel("Amplitude")
+        ax.set_title(f"Impulse response - {fd.spec.name}")
+        _grid(ax)
+        return
+
     ax.stem(n, h, linefmt="tab:blue", markerfmt="o", basefmt=" ")
     for line in ax.get_lines():
         line.set_markersize(2.5)
@@ -249,15 +265,30 @@ def plot_impulse(
 def plot_step(fig: Figure, fd: FilterDesign) -> None:
     ax = fig.add_subplot(111)
     n, y = analysis.step_response(fd)
-    ax.plot(n, y, **IDEAL)
-    final = float(y[-1])
-    ax.axhline(final, color="tab:grey", linewidth=0.8, linestyle="--")
-    overshoot = (float(np.max(y)) - final) / abs(final) * 100 if final else 0.0
+
+    if np.iscomplexobj(y):
+        # Overshoot against a complex settling value is not a meaningful
+        # number, so show the envelope and its components instead of
+        # inventing one.
+        ax.plot(n, np.real(y), linewidth=0.9, alpha=0.75, label="I")
+        ax.plot(n, np.imag(y), linewidth=0.9, alpha=0.75, label="Q")
+        ax.plot(n, np.abs(y), linewidth=1.4, color="k", alpha=0.7,
+                label="envelope")
+        ax.legend(loc="best", fontsize=8)
+        ax.set_title(f"Step response - {fd.spec.name}")
+    else:
+        ax.plot(n, y, **IDEAL)
+        final = float(y[-1])
+        ax.axhline(final, color="tab:grey", linewidth=0.8, linestyle="--")
+        overshoot = (
+            (float(np.max(y)) - final) / abs(final) * 100 if final else 0.0
+        )
+        ax.set_title(
+            f"Step response - {fd.spec.name}  (overshoot {overshoot:.1f}%)"
+        )
+
     ax.set_xlabel("Sample")
     ax.set_ylabel("Amplitude")
-    ax.set_title(
-        f"Step response - {fd.spec.name}  (overshoot {overshoot:.1f}%)"
-    )
     _grid(ax)
 
 
@@ -398,10 +429,15 @@ def plot_overview(
     axes[0, 1].set_xlabel(unit, fontsize=8)
     _grid(axes[0, 1])
 
-    # Impulse
+    # Impulse. Complex taps are shown as their envelope: at overview size
+    # there is no room for I and Q, and the envelope is the informative half.
     n, h = analysis.impulse_response(fd)
-    axes[1, 0].plot(n, h, linewidth=1.0, color="tab:blue")
-    axes[1, 0].set_title("Impulse response", fontsize=9)
+    if np.iscomplexobj(h):
+        axes[1, 0].plot(n, np.abs(h), linewidth=1.0, color="tab:blue")
+        axes[1, 0].set_title("Impulse response (envelope)", fontsize=9)
+    else:
+        axes[1, 0].plot(n, h, linewidth=1.0, color="tab:blue")
+        axes[1, 0].set_title("Impulse response", fontsize=9)
     axes[1, 0].set_xlabel("sample", fontsize=8)
     _grid(axes[1, 0])
 

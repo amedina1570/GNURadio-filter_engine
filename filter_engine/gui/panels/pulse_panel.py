@@ -116,11 +116,19 @@ class PulsePanel(QtWidgets.QWidget):
         self.delay_label = QtWidgets.QLabel("Centre at")
         form.addRow(self.delay_label, self.delay_spin)
 
-        self.prf_edit = FrequencyEdit(0.0)
-        self.prf_edit.setToolTip("0 emits a single pulse.")
-        self.prf_edit.valueChanged.connect(self._regenerate)
-        self.prf_label = QtWidgets.QLabel("PRF")
-        form.addRow(self.prf_label, self.prf_edit)
+        # PRI, not PRF: radar timing is reasoned about as an interval, and
+        # the PRI is directly the listening window that sets unambiguous range.
+        self.pri_spin = _spin(0.0, 0.0, 1e9, 4, " us")
+        self.pri_spin.setToolTip(
+            "Time from one pulse to the next. 0 emits a single pulse."
+        )
+        self.pri_spin.valueChanged.connect(self._regenerate)
+        self.pri_label = QtWidgets.QLabel("PRI")
+        form.addRow(self.pri_label, self.pri_spin)
+
+        self.pri_derived = QtWidgets.QLabel()
+        self.pri_derived.setStyleSheet("font-style: italic;")
+        form.addRow("", self.pri_derived)
 
         self.carrier_edit = FrequencyEdit(0.0)
         self.carrier_edit.setToolTip(
@@ -169,6 +177,46 @@ class PulsePanel(QtWidgets.QWidget):
         self.symrate_edit.valueChanged.connect(self._regenerate)
         dig_form.addRow("Symbol rate", self.symrate_edit)
         column.addWidget(self.digital_box)
+
+        # --- radar ---
+        self.radar_box = QtWidgets.QGroupBox("Radar echo")
+        radar_form = QtWidgets.QFormLayout(self.radar_box)
+        self.lfm_bw_edit = FrequencyEdit(10e6)
+        self.lfm_bw_edit.setToolTip(
+            "Chirp bandwidth of the echo. Match it to the filter or the pulse "
+            "will not compress."
+        )
+        self.lfm_bw_edit.valueChanged.connect(self._regenerate)
+        radar_form.addRow("Echo bandwidth", self.lfm_bw_edit)
+
+        self.match_button = QtWidgets.QPushButton("Match the filter")
+        self.match_button.setToolTip(
+            "Copy the pulse width and chirp bandwidth from the current design."
+        )
+        self.match_button.clicked.connect(self._match_design)
+        radar_form.addRow("", self.match_button)
+
+        self.sep_spin = _spin(2.0, 0.001, 1e6, 4, " us")
+        self.sep_spin.setToolTip(
+            "How far behind the first target the second one sits."
+        )
+        self.sep_spin.valueChanged.connect(self._regenerate)
+        self.sep_row_label = QtWidgets.QLabel("Target separation")
+        radar_form.addRow(self.sep_row_label, self.sep_spin)
+
+        self.sep_derived = QtWidgets.QLabel()
+        self.sep_derived.setStyleSheet("font-style: italic;")
+        radar_form.addRow("", self.sep_derived)
+
+        self.target2_spin = _spin(-40.0, -120.0, 0.0, 1, " dB")
+        self.target2_spin.setToolTip(
+            "How much weaker the second target is. If this is above the "
+            "filter's peak sidelobe level it will be buried."
+        )
+        self.target2_spin.valueChanged.connect(self._regenerate)
+        self.target2_label = QtWidgets.QLabel("Second target")
+        radar_form.addRow(self.target2_label, self.target2_spin)
+        column.addWidget(self.radar_box)
 
         # --- impairments ---
         noise_box = QtWidgets.QGroupBox("Impairments")
@@ -220,11 +268,29 @@ class PulsePanel(QtWidgets.QWidget):
 
     def _sync_rates(self, design: FilterDesign) -> None:
         """Keep pulse defaults sensible when the filter's sample rate changes."""
+        from ...core.spec import Response
+
         fs = design.sample_rate
-        if abs(self.symrate_edit.value()) < 1e-9 or self.symrate_edit.value() > fs / 2:
-            self._loading = True
-            self.symrate_edit.setValue(fs / 10.0)
+        self._loading = True
+        try:
+            if (
+                abs(self.symrate_edit.value()) < 1e-9
+                or self.symrate_edit.value() > fs / 2
+            ):
+                self.symrate_edit.setValue(fs / 10.0)
+            # An echo wider than the sample rate cannot be generated at all,
+            # so follow the design rather than leaving an invalid default.
+            if self.lfm_bw_edit.value() > fs:
+                self.lfm_bw_edit.setValue(
+                    design.spec.chirp_bandwidth_hz
+                    if 0 < design.spec.chirp_bandwidth_hz <= fs
+                    else fs / 2.0
+                )
+        finally:
             self._loading = False
+        self.match_button.setEnabled(
+            design.spec.response is Response.MATCHED_LFM
+        )
 
     # --------------------------------------------------------------- handlers
     def _kind(self) -> PulseKind:
@@ -240,6 +306,13 @@ class PulsePanel(QtWidgets.QWidget):
         self.chirp_box.setVisible(kind is PulseKind.CHIRP)
         self.tone_box.setVisible(kind is PulseKind.TWO_TONE)
         self.digital_box.setVisible(kind is PulseKind.PRBS_BPSK)
+        self.radar_box.setVisible(kind.is_radar)
+        two_targets = kind is PulseKind.TWO_TARGETS
+        self.sep_spin.setVisible(two_targets)
+        self.sep_row_label.setVisible(two_targets)
+        self.sep_derived.setVisible(two_targets)
+        self.target2_spin.setVisible(two_targets)
+        self.target2_label.setVisible(two_targets)
 
         uses_width = kind in _USES_WIDTH
         self.width_spin.setVisible(uses_width)
@@ -247,8 +320,9 @@ class PulsePanel(QtWidgets.QWidget):
         uses_delay = kind in _USES_DELAY
         self.delay_spin.setVisible(uses_delay)
         self.delay_label.setVisible(uses_delay)
-        self.prf_edit.setVisible(uses_width)
-        self.prf_label.setVisible(uses_width)
+        self.pri_spin.setVisible(uses_width)
+        self.pri_label.setVisible(uses_width)
+        self.pri_derived.setVisible(uses_width)
 
         self.noise_check.setEnabled(kind is not PulseKind.AWGN)
         self.snr_spin.setEnabled(
@@ -266,7 +340,7 @@ class PulsePanel(QtWidgets.QWidget):
             delay_s=self.delay_spin.value() * 1e-6,
             carrier_hz=self.carrier_edit.value(),
             force_complex=self.complex_check.isChecked(),
-            prf_hz=self.prf_edit.value(),
+            pri_s=self.pri_spin.value() * 1e-6,
             chirp_f0_hz=self.chirp_f0.value(),
             chirp_f1_hz=self.chirp_f1.value(),
             chirp_method=str(self.chirp_method.currentData()),
@@ -274,13 +348,67 @@ class PulsePanel(QtWidgets.QWidget):
             tone2_hz=self.tone2.value(),
             symbol_rate=self.symrate_edit.value(),
             seed=self.seed_spin.value(),
+            lfm_bandwidth_hz=self.lfm_bw_edit.value(),
+            target_separation_s=self.sep_spin.value() * 1e-6,
+            target2_relative_db=self.target2_spin.value(),
             snr_db=self.snr_spin.value() if self.noise_check.isChecked() else None,
         )
+
+    def _match_design(self) -> None:
+        """Copy the pulse parameters from the filter being designed.
+
+        A matched filter only compresses the waveform it was built for, so
+        this removes the most common way to get a confusing result: an echo
+        whose chirp does not match the filter's.
+        """
+        from ...core.spec import Response
+
+        if self._design is None:
+            return
+        spec = self._design.spec
+        if spec.response is not Response.MATCHED_LFM:
+            return
+        self._loading = True
+        try:
+            self.width_spin.setValue(spec.pulse_width_s * 1e6)
+            self.lfm_bw_edit.setValue(spec.chirp_bandwidth_hz)
+            if spec.pri_s > 0:
+                self.duration_spin.setValue(min(spec.pri_s, 5e-3) * 1e3)
+                self.delay_spin.setValue(spec.pulse_width_s * 1e6)
+        finally:
+            self._loading = False
+        self._regenerate()
+
+    def _update_derived(self) -> None:
+        """Show the radar consequences of the timing choices."""
+        from ...core.radar import C_LIGHT, unambiguous_range_m
+
+        pri = self.pri_spin.value() * 1e-6
+        if pri > 0:
+            width = self.width_spin.value() * 1e-6
+            self.pri_derived.setText(
+                f"= {1.0 / pri:,.6g} Hz PRF, "
+                f"{unambiguous_range_m(pri) / 1e3:,.4g} km unambiguous, "
+                f"{100 * width / pri:.2f}% duty"
+            )
+        else:
+            self.pri_derived.setText("single pulse")
+
+        separation = self.sep_spin.value() * 1e-6
+        bandwidth = self.lfm_bw_edit.value()
+        if separation > 0 and bandwidth > 0:
+            self.sep_derived.setText(
+                f"= {separation * C_LIGHT / 2:,.4g} m apart, "
+                f"{separation * bandwidth:.1f} resolution cells"
+            )
+        else:
+            self.sep_derived.setText("")
 
     def _regenerate(self, *_args) -> None:
         if self._loading:
             return
         self._update_visibility()
+        self._update_derived()
         if self._design is None:
             return
         try:

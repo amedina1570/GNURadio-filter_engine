@@ -209,6 +209,11 @@ def group_delay(fd: FilterDesign, freqs: np.ndarray) -> np.ndarray:
         warnings.filterwarnings(
             "ignore", message=".*denominator is extremely small.*"
         )
+        # An MTI canceller is *designed* with a zero at DC, so scipy reporting
+        # a singular group delay there is the filter working, not a fault.
+        warnings.filterwarnings(
+            "ignore", message=".*group delay is singular.*"
+        )
         if fd.sos is not None:
             total = np.zeros_like(freqs)
             for section in fd.sos:
@@ -711,7 +716,7 @@ def mti_velocity_response(
         max_velocity_ms = abs(velocity_ms(prf * 1.25, spec.radar_carrier_hz))
 
     velocities = np.linspace(0.0, max_velocity_ms, num_points)
-    taps = np.asarray(fd.b, dtype=float)[::-1]
+    taps = np.asarray(fd.b)[::-1]
     # Evaluating past Nyquist is deliberate here: that wrap-around is exactly
     # what produces blind speeds, so it must show on the plot.
     z = np.exp(

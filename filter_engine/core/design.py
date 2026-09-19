@@ -153,14 +153,16 @@ class FilterDesign:
     def poles(self) -> np.ndarray:
         return self._zpk()[1]
 
-    def _zpk(self) -> tuple[np.ndarray, np.ndarray, float]:
+    def _zpk(self) -> tuple[np.ndarray, np.ndarray, complex]:
         with _quiet_bad_coefficients():
             if self.sos is not None:
                 z, p, k = signal.sos2zpk(self.sos)
                 z, p = _drop_origin_pole_zero_pairs(z, p)
             else:
                 z, p, k = signal.tf2zpk(self.b, self.a)
-        return np.asarray(z), np.asarray(p), float(k)
+        # k is complex for a complex filter; coercing it to float would
+        # silently throw the phase away.
+        return np.asarray(z), np.asarray(p), complex(k)
 
     def summary(self) -> str:
         """One-paragraph description, shown in the GUI status area."""
