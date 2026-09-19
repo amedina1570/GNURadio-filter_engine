@@ -1,0 +1,10 @@
+# Core DSP / numerics
+numpy>=1.24
+scipy>=1.10
+
+# Plotting
+matplotlib>=3.7
+
+# GUI (Qt binding). PySide6 is the default and is LGPL-licensed.
+# PyQt6 also works -- set FILTER_ENGINE_QT_API=pyqt6 to force it.
+PySide6>=6.5
