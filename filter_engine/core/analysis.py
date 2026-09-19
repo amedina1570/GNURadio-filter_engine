@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy import signal
@@ -23,10 +23,15 @@ from .spec import Response
 __all__ = [
     "FrequencyResponse",
     "Measurements",
+    "RadarMetrics",
     "frequency_response",
     "impulse_response",
     "step_response",
     "measure",
+    "compressed_response",
+    "radar_metrics",
+    "mti_velocity_response",
+    "ambiguity_function",
     "db20",
 ]
 
@@ -356,3 +361,311 @@ def _crossings(freqs: np.ndarray, mag_db: np.ndarray, level_db: float) -> list[f
         t = (level_db - y0) / (y1 - y0)
         out.append(float(freqs[i] + t * (freqs[i + 1] - freqs[i])))
     return out
+
+
+# --------------------------------------------------------------------------
+# Radar figures of merit
+#
+# A pulse compression filter is not judged by passband ripple. It is judged by
+# what a strong target does to its neighbours: how high the worst range
+# sidelobe sits (PSLR), how much total energy leaks out of the mainlobe
+# (ISLR), and how much resolution the weighting cost to get there.
+# --------------------------------------------------------------------------
+@dataclass
+class RadarMetrics:
+    """Range-sidelobe and resolution performance of a compression filter."""
+
+    #: Peak sidelobe ratio: the worst sidelobe, dB below the compressed peak.
+    #: The number that decides whether a strong target masks a weak one.
+    pslr_db: float = float("nan")
+    #: Integrated sidelobe ratio: total sidelobe energy over mainlobe energy,
+    #: in dB. What matters against distributed clutter rather than a point
+    #: target.
+    islr_db: float = float("nan")
+    #: -3 dB width of the compressed pulse, in seconds and in metres.
+    mainlobe_3db_s: float = float("nan")
+    mainlobe_3db_m: float = float("nan")
+    #: Null-to-null width of the compressed mainlobe, in seconds.
+    mainlobe_null_s: float = float("nan")
+    #: Resolution implied by the chirp bandwidth alone, for comparison.
+    range_resolution_m: float = float("nan")
+    #: How much the weighting broadened the mainlobe, against no weighting.
+    broadening: float = float("nan")
+    #: Pulse compression ratio and the gain it buys.
+    time_bandwidth_product: float = float("nan")
+    processing_gain_db: float = float("nan")
+    #: SNR given up by weighting the filter away from a true matched filter.
+    #: Always a loss: the matched filter is optimal for SNR by definition, and
+    #: every taper that buys sidelobe suppression pays for it here.
+    weighting_loss_db: float = float("nan")
+    notes: list[str] = field(default_factory=list)
+
+    def as_rows(self) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for label, value, spec, unit in (
+            ("Peak sidelobe (PSLR)", self.pslr_db, ".1f", " dB"),
+            ("Integrated sidelobe (ISLR)", self.islr_db, ".1f", " dB"),
+            ("Compressed width (-3 dB)", self.mainlobe_3db_s * 1e6, ".3f", " us"),
+            ("Range resolution achieved", self.mainlobe_3db_m, ",.4g", " m"),
+            ("Range resolution from bandwidth", self.range_resolution_m, ",.4g", " m"),
+            ("Mainlobe broadening", self.broadening, ".2f", "x"),
+            ("Compression ratio", self.time_bandwidth_product, ",.0f", ""),
+            ("Processing gain", self.processing_gain_db, ".1f", " dB"),
+            ("Weighting SNR loss", self.weighting_loss_db, ".2f", " dB"),
+        ):
+            if value is None or not np.isfinite(value):
+                continue
+            rows.append((label, f"{value:{spec}}{unit}"))
+        return rows
+
+
+def compressed_response(fd: FilterDesign) -> tuple[np.ndarray, np.ndarray]:
+    """The compressed pulse: ``(lag_seconds, complex_amplitude)``.
+
+    For an LFM matched filter this is the filter's response to the real,
+    *unweighted* transmit pulse. That distinction matters: autocorrelating the
+    filter instead applies the taper twice and reports range sidelobes more
+    than 10 dB better than the hardware will ever produce.
+
+    For any other FIR the autocorrelation is the right analogue, since such a
+    filter is its own matched reference.
+    """
+    from .radar import lfm_transmit_pulse
+
+    taps = np.asarray(fd.b)
+    spec = fd.spec
+
+    if spec.response is Response.MATCHED_LFM:
+        reference = lfm_transmit_pulse(
+            spec.sample_rate,
+            spec.pulse_width_s,
+            spec.chirp_bandwidth_hz,
+            spec.down_chirp,
+        )
+        out = np.convolve(taps, reference)
+    else:
+        out = np.convolve(taps, np.conj(taps[::-1]))
+
+    peak = int(np.argmax(np.abs(out)))
+    lags = (np.arange(out.size) - peak) / spec.sample_rate
+    return lags, out
+
+
+def _mainlobe_bounds(mag: np.ndarray, peak: int) -> tuple[int, int]:
+    """Indices of the first null either side of ``peak``."""
+    right = peak
+    while right + 1 < mag.size and mag[right + 1] < mag[right]:
+        right += 1
+    left = peak
+    while left - 1 >= 0 and mag[left - 1] < mag[left]:
+        left -= 1
+    return left, right
+
+
+def _width_at(mag: np.ndarray, peak: int, fraction: float) -> float:
+    """Width in samples where ``mag`` falls to ``fraction`` of its peak.
+
+    Both crossings are interpolated between the bracketing samples. At a
+    realistic sample rate a compressed pulse is only a couple of samples wide,
+    so taking the nearest sample instead would quantise the answer into
+    uselessness.
+    """
+    target = mag[peak] * fraction
+    right = peak
+    while right + 1 < mag.size and mag[right + 1] > target:
+        right += 1
+    left = peak
+    while left - 1 >= 0 and mag[left - 1] > target:
+        left -= 1
+
+    # The crossing sits between `right` and `right+1`, and between `left-1`
+    # and `left`. The fraction is measured from the inner sample outwards, so
+    # it is *added* going right and *subtracted* going left.
+    hi = float(right)
+    if right + 1 < mag.size:
+        drop = mag[right] - mag[right + 1]
+        if drop > 0:
+            hi = right + (mag[right] - target) / drop
+
+    lo = float(left)
+    if left - 1 >= 0:
+        drop = mag[left] - mag[left - 1]
+        if drop > 0:
+            lo = left - (mag[left] - target) / drop
+
+    return max(hi - lo, 0.0)
+
+
+def radar_metrics(fd: FilterDesign) -> RadarMetrics:
+    """Measure range sidelobes and resolution from the compressed pulse."""
+    from .radar import C_LIGHT, lfm_matched_filter, lfm_transmit_pulse
+
+    spec = fd.spec
+    metrics = RadarMetrics()
+    notes = metrics.notes
+
+    _lags, compressed = compressed_response(fd)
+    mag = np.abs(compressed)
+    if mag.size < 5 or np.max(mag) <= 0:
+        notes.append("The compressed pulse is too short to measure.")
+        return metrics
+
+    peak = int(np.argmax(mag))
+    mag = mag / mag[peak]
+    left, right = _mainlobe_bounds(mag, peak)
+
+    sidelobes = np.concatenate([mag[:left], mag[right + 1 :]])
+    mainlobe = mag[left : right + 1]
+
+    if sidelobes.size:
+        metrics.pslr_db = float(db20(np.max(sidelobes)))
+        side_energy = float(np.sum(sidelobes**2))
+        main_energy = float(np.sum(mainlobe**2))
+        if main_energy > 0:
+            metrics.islr_db = 10.0 * math.log10(max(side_energy / main_energy, 1e-30))
+
+    fs = spec.sample_rate
+    width_3db = _width_at(mag, peak, 10 ** (-3.0 / 20.0))
+    metrics.mainlobe_3db_s = width_3db / fs
+    metrics.mainlobe_3db_m = width_3db / fs * C_LIGHT / 2.0
+    metrics.mainlobe_null_s = (right - left) / fs
+
+    if spec.response is not Response.MATCHED_LFM:
+        return metrics
+
+    # --- pulse-compression-only figures ----------------------------------
+    metrics.range_resolution_m = spec.range_resolution_m
+    metrics.time_bandwidth_product = spec.time_bandwidth_product
+    metrics.processing_gain_db = 10.0 * math.log10(
+        max(spec.time_bandwidth_product, 1e-12)
+    )
+
+    # Broadening is measured against the unweighted filter, which is the true
+    # matched filter and therefore both the resolution and the SNR optimum.
+    unweighted = lfm_matched_filter(
+        sample_rate=spec.sample_rate,
+        pulse_width_s=spec.pulse_width_s,
+        bandwidth_hz=spec.chirp_bandwidth_hz,
+        window="boxcar",
+        down_chirp=spec.down_chirp,
+        normalisation="energy",
+    )
+    tx = lfm_transmit_pulse(
+        spec.sample_rate, spec.pulse_width_s, spec.chirp_bandwidth_hz, spec.down_chirp
+    )
+    plain = np.abs(np.convolve(unweighted, tx))
+    plain_peak = int(np.argmax(plain))
+    plain = plain / plain[plain_peak]
+    plain_width = _width_at(plain, plain_peak, 10 ** (-3.0 / 20.0))
+    if plain_width > 0:
+        metrics.broadening = width_3db / plain_width
+
+    # Mismatch loss of the taper: (sum w)^2 / (N * sum w^2), which is 0 dB for
+    # a rectangular window and a loss for every other.
+    weights = np.abs(np.asarray(fd.b))
+    peak_w = float(np.max(weights))
+    if peak_w > 0:
+        weights = weights / peak_w
+        n = weights.size
+        denominator = n * float(np.sum(weights**2))
+        if denominator > 0:
+            efficiency = float(np.sum(weights)) ** 2 / denominator
+            metrics.weighting_loss_db = -10.0 * math.log10(max(efficiency, 1e-30))
+
+    if spec.time_bandwidth_product < 50:
+        notes.append(
+            f"A time-bandwidth product of {spec.time_bandwidth_product:,.0f} is "
+            "low. Below roughly 50 the chirp spectrum is too ragged at its "
+            "edges for the weighting to reach its nominal sidelobe level."
+        )
+    return metrics
+
+
+# --------------------------------------------------------------------------
+# MTI / Doppler
+# --------------------------------------------------------------------------
+def mti_velocity_response(
+    fd: FilterDesign, num_points: int = 2048, max_velocity_ms: float | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Canceller response against radial velocity, as ``(m/s, dB)``.
+
+    An MTI canceller's frequency axis *is* Doppler, so the useful view is
+    velocity: it shows the clutter notch at zero and the blind speeds where
+    legitimate targets vanish along with the clutter.
+    """
+    from .radar import doppler_hz, velocity_ms
+
+    spec = fd.spec
+    prf = spec.sample_rate
+    if max_velocity_ms is None:
+        # Far enough to show the first blind speed and back down again.
+        max_velocity_ms = abs(velocity_ms(prf * 1.25, spec.radar_carrier_hz))
+
+    velocities = np.linspace(0.0, max_velocity_ms, num_points)
+    taps = np.asarray(fd.b, dtype=float)[::-1]
+    # Evaluating past Nyquist is deliberate here: that wrap-around is exactly
+    # what produces blind speeds, so it must show on the plot.
+    z = np.exp(
+        -2j
+        * np.pi
+        * np.array([doppler_hz(v, spec.radar_carrier_hz) for v in velocities])
+        / prf
+    )
+    h = np.polyval(taps, z)
+    return velocities, db20(h)
+
+
+def ambiguity_function(
+    fd: FilterDesign,
+    num_doppler: int = 121,
+    max_doppler_hz: float | None = None,
+    delay_decimation: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Range-Doppler ambiguity surface, as ``(delay_s, doppler_hz, dB)``.
+
+    Shows what compression does to a target that is *not* at zero Doppler. An
+    LFM chirp's characteristic diagonal ridge is range-Doppler coupling: a
+    moving target still compresses cleanly, but at the wrong range, and this
+    plot says how far wrong.
+    """
+    from .radar import lfm_transmit_pulse
+
+    spec = fd.spec
+    taps = np.asarray(fd.b)
+
+    if spec.response is Response.MATCHED_LFM:
+        reference = lfm_transmit_pulse(
+            spec.sample_rate,
+            spec.pulse_width_s,
+            spec.chirp_bandwidth_hz,
+            spec.down_chirp,
+        )
+    else:
+        reference = np.conj(taps[::-1])
+
+    if max_doppler_hz is None:
+        max_doppler_hz = (
+            spec.chirp_bandwidth_hz / 4.0
+            if spec.chirp_bandwidth_hz > 0
+            else spec.sample_rate / 8.0
+        )
+
+    dopplers = np.linspace(-max_doppler_hz, max_doppler_hz, num_doppler)
+    t = np.arange(reference.size) / spec.sample_rate
+
+    rows = []
+    for shift in dopplers:
+        rows.append(
+            np.abs(np.convolve(taps, reference * np.exp(2j * np.pi * shift * t)))[
+                ::delay_decimation
+            ]
+        )
+
+    grid = np.asarray(rows)
+    peak = float(np.max(grid))
+    if peak > 0:
+        grid = grid / peak
+
+    centre = int(np.argmax(grid[num_doppler // 2]))
+    delays = (np.arange(grid.shape[1]) - centre) * delay_decimation / spec.sample_rate
+    return delays, dopplers, db20(grid)

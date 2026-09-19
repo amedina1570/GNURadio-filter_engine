@@ -34,10 +34,24 @@ class Response(str, Enum):
     RRC = "root_raised_cosine"
     RC = "raised_cosine"
     GAUSSIAN = "gaussian"
+    #: Pulse compression: the matched filter for a linear-FM (chirp) pulse.
+    MATCHED_LFM = "matched_lfm"
+    #: Moving target indication: an N-pulse canceller running in slow time.
+    MTI_CANCELLER = "mti_canceller"
 
     @property
     def is_pulse_shaping(self) -> bool:
         return self in (Response.RRC, Response.RC, Response.GAUSSIAN)
+
+    @property
+    def is_radar(self) -> bool:
+        """True for the responses defined by radar parameters, not band edges."""
+        return self in (Response.MATCHED_LFM, Response.MTI_CANCELLER)
+
+    @property
+    def is_complex(self) -> bool:
+        """True when the design has complex (I/Q) coefficients."""
+        return self is Response.MATCHED_LFM
 
     @property
     def is_multiband(self) -> bool:
@@ -76,7 +90,15 @@ WINDOWS: tuple[str, ...] = (
     "nuttall",
     "flattop",
     "kaiser",
+    # Radar weightings. Both are parameterised: you name the sidelobe level
+    # rather than inheriting whatever the window happens to give.
+    "taylor",
+    "chebwin",
 )
+
+#: Windows whose sidelobe level is set by their own parameters rather than
+#: fixed by their shape.  These can reach any attenuation you ask for.
+PARAMETERISED_WINDOWS: frozenset[str] = frozenset({"kaiser", "taylor", "chebwin"})
 
 #: Normalisation applied to pulse-shaping taps.
 NORMALISATIONS: tuple[str, ...] = ("sum", "energy", "peak", "none")
@@ -132,6 +154,36 @@ class FilterSpec:
     #: :attr:`auto_order` is off; otherwise it is derived from the stopband.
     window_param: float = 8.6
 
+    # --- radar weighting parameters ------------------------------------------
+    #: Taylor: how many sidelobes either side of the mainlobe are held at the
+    #: design level before they start falling away.  More gives a flatter,
+    #: better-controlled near-in sidelobe region; too many and the taper
+    #: develops end spikes and loses efficiency.  4 to 6 is the usual choice.
+    taylor_nbar: int = 4
+    #: Taylor: the design sidelobe level, in dB below the mainlobe peak.
+    taylor_sll_db: float = 35.0
+    #: Dolph-Chebyshev: every sidelobe sits exactly this far below the peak.
+    cheb_atten_db: float = 60.0
+
+    # --- radar: pulse compression --------------------------------------------
+    #: Transmitted pulse width (before compression), in seconds.
+    pulse_width_s: float = 10e-6
+    #: Bandwidth the chirp sweeps across the pulse, in Hz.  This alone sets
+    #: range resolution.
+    chirp_bandwidth_hz: float = 10e6
+    #: Sweep downwards in frequency instead of upwards.
+    down_chirp: bool = False
+
+    # --- radar: pulse timing and Doppler -------------------------------------
+    #: Pulse repetition interval: the time between transmitted pulses.
+    #: For an MTI canceller this *is* the sample interval, because the filter
+    #: runs across pulses rather than along one.
+    pri_s: float = 1e-3
+    #: Number of pulses the MTI canceller combines (2 = single canceller).
+    mti_pulses: int = 2
+    #: Transmit carrier frequency, used to turn Doppler into velocity.
+    radar_carrier_hz: float = 10e9
+
     # --- pulse shaping -------------------------------------------------------
     symbol_rate: float = 100_000.0
     #: Excess bandwidth / roll-off factor for RRC and RC.
@@ -161,6 +213,50 @@ class FilterSpec:
         if self.symbol_rate <= 0:
             raise SpecError("symbol_rate must be > 0 for a pulse-shaping filter")
         return self.sample_rate / self.symbol_rate
+
+    # ------------------------------------------------------- radar quantities
+    @property
+    def prf_hz(self) -> float:
+        """Pulse repetition frequency, the reciprocal of the PRI."""
+        return 1.0 / self.pri_s if self.pri_s > 0 else float("inf")
+
+    @property
+    def time_bandwidth_product(self) -> float:
+        """Pulse compression ratio: how much the pulse shortens on compression.
+
+        Also the processing gain in power terms, so 10*log10 of it is the SNR
+        improvement compression buys.
+        """
+        return self.chirp_bandwidth_hz * self.pulse_width_s
+
+    @property
+    def duty_cycle(self) -> float:
+        """Fraction of time the transmitter is on."""
+        return self.pulse_width_s / self.pri_s if self.pri_s > 0 else float("inf")
+
+    @property
+    def range_resolution_m(self) -> float:
+        from .radar import range_resolution_m
+
+        return range_resolution_m(self.chirp_bandwidth_hz)
+
+    @property
+    def unambiguous_range_m(self) -> float:
+        from .radar import unambiguous_range_m
+
+        return unambiguous_range_m(self.pri_s)
+
+    @property
+    def unambiguous_velocity_ms(self) -> float:
+        from .radar import unambiguous_velocity_ms
+
+        return unambiguous_velocity_ms(self.pri_s, self.radar_carrier_hz)
+
+    @property
+    def blind_speed_ms(self) -> float:
+        from .radar import blind_speed_ms
+
+        return blind_speed_ms(self.pri_s, self.radar_carrier_hz)
 
     @property
     def method(self) -> str:
@@ -218,6 +314,10 @@ class FilterSpec:
             raise SpecError("Sample rate must be greater than 0 Hz.")
         nyq = self.nyquist
 
+        if self.response.is_radar:
+            self._validate_radar()
+            return
+
         if self.response.is_pulse_shaping:
             self._validate_pulse_shaping()
             self._validate_order()
@@ -259,6 +359,56 @@ class FilterSpec:
         if self.stopband_atten_db <= self.passband_ripple_db:
             raise SpecError("Stopband attenuation must exceed the passband ripple.")
         self._validate_order()
+
+    def _validate_radar(self) -> None:
+        """Check the radar responses, in radar terms."""
+        if self.pri_s <= 0:
+            raise SpecError("Pulse repetition interval must be greater than 0 s.")
+        if self.radar_carrier_hz <= 0:
+            raise SpecError("Carrier frequency must be greater than 0 Hz.")
+
+        if self.response is Response.MTI_CANCELLER:
+            if self.mti_pulses < 2:
+                raise SpecError("An MTI canceller needs at least 2 pulses.")
+            if self.mti_pulses > 5:
+                raise SpecError(
+                    "Cancellers beyond 5 pulses are not offered: each extra "
+                    "pulse widens the clutter notch and eats more of the "
+                    "usable Doppler band for very little extra rejection."
+                )
+            return
+
+        # Matched filter for an LFM pulse.
+        if self.pulse_width_s <= 0:
+            raise SpecError("Pulse width must be greater than 0 s.")
+        if self.chirp_bandwidth_hz <= 0:
+            raise SpecError("Chirp bandwidth must be greater than 0 Hz.")
+        if self.pulse_width_s >= self.pri_s:
+            raise SpecError(
+                f"The pulse ({self.pulse_width_s * 1e6:.4g} us) is longer than "
+                f"the PRI ({self.pri_s * 1e6:.4g} us); the transmitter would "
+                "never switch off. Shorten the pulse or lengthen the PRI."
+            )
+        # The chirp occupies +/-B/2 at complex baseband, so the sample rate has
+        # to cover the whole sweep or the ends of it alias inward.
+        if self.chirp_bandwidth_hz > self.sample_rate:
+            raise SpecError(
+                f"A {self.chirp_bandwidth_hz / 1e6:.4g} MHz chirp does not fit "
+                f"in a {self.sample_rate / 1e6:.4g} MS/s complex sample rate. "
+                "Raise the sample rate to at least the chirp bandwidth."
+            )
+        if self.time_bandwidth_product < 10:
+            raise SpecError(
+                f"The time-bandwidth product is only "
+                f"{self.time_bandwidth_product:.1f}. Below about 10 there is "
+                "nothing to compress and the sidelobe behaviour is erratic; "
+                "lengthen the pulse or widen the chirp."
+            )
+        if self.window not in WINDOWS:
+            raise SpecError(
+                f"Unknown weighting {self.window!r}; expected one of "
+                f"{list(WINDOWS)}."
+            )
 
     def _validate_pulse_shaping(self) -> None:
         if self.symbol_rate <= 0:

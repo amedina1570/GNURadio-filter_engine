@@ -10,6 +10,7 @@ cascades are what you actually want to implement, and ``(b, a)`` above order
 from __future__ import annotations
 
 import contextlib
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -110,6 +111,16 @@ class FilterDesign:
         return self.sos is None
 
     @property
+    def is_complex(self) -> bool:
+        """True when the taps are complex (I/Q).
+
+        A matched filter for a complex-baseband chirp has to be complex: real
+        taps cannot tell an up-sweep from its mirror image, and the compressed
+        pulse would fold on top of itself.
+        """
+        return bool(np.iscomplexobj(self.b))
+
+    @property
     def sample_rate(self) -> float:
         return self.spec.sample_rate
 
@@ -181,11 +192,73 @@ def design(spec: FilterSpec) -> FilterDesign:
     """
     spec.validate()
 
+    if spec.response.is_radar:
+        return _design_radar(spec)
     if spec.response.is_pulse_shaping:
         return _design_pulse_shaping(spec)
     if spec.family is FilterFamily.FIR:
         return _design_fir(spec)
     return _design_iir(spec)
+
+
+# --------------------------------------------------------------------------
+# Radar
+# --------------------------------------------------------------------------
+def _design_radar(spec: FilterSpec) -> FilterDesign:
+    from . import radar
+
+    if spec.response is Response.MTI_CANCELLER:
+        taps = radar.mti_canceller(spec.mti_pulses) * spec.gain
+        notes = [
+            f"{spec.mti_pulses}-pulse binomial canceller "
+            f"(order {spec.mti_pulses - 1}).",
+            "This filter runs in slow time -- one sample per PRI, across "
+            "pulses at the same range -- so its sample rate is the "
+            f"{spec.prf_hz:,.6g} Hz PRF and every frequency on the response "
+            "plot is a Doppler frequency.",
+            f"Blind speeds every {spec.blind_speed_ms:,.4g} m/s: a target "
+            "moving at one of those advances a whole Doppler cycle between "
+            "pulses and is cancelled along with the clutter.",
+        ]
+        return FilterDesign(
+            spec=spec, b=np.asarray(taps, dtype=float), a=np.array([1.0]), notes=notes
+        )
+
+    # Matched filter for a linear-FM pulse.
+    taps = radar.lfm_matched_filter(
+        sample_rate=spec.sample_rate,
+        pulse_width_s=spec.pulse_width_s,
+        bandwidth_hz=spec.chirp_bandwidth_hz,
+        window=spec.window,
+        down_chirp=spec.down_chirp,
+        taylor_nbar=spec.taylor_nbar,
+        taylor_sll_db=spec.taylor_sll_db,
+        cheb_atten_db=spec.cheb_atten_db,
+        kaiser_beta=spec.window_param,
+        normalisation="energy",
+    )
+    taps = taps * spec.gain
+
+    tbp = spec.time_bandwidth_product
+    notes = [
+        f"{'Down' if spec.down_chirp else 'Up'}-chirp matched filter: "
+        f"{spec.chirp_bandwidth_hz / 1e6:,.6g} MHz swept over "
+        f"{spec.pulse_width_s * 1e6:,.6g} us.",
+        f"Time-bandwidth product {tbp:,.0f} -- the pulse compresses by that "
+        f"factor, for {10 * math.log10(tbp):.1f} dB of processing gain.",
+        f"Range resolution {spec.range_resolution_m:,.4g} m, set by the "
+        "bandwidth alone.",
+        f"Weighting: {spec.window}. Taps are complex (I/Q).",
+    ]
+    if spec.window == "boxcar":
+        notes.append(
+            "Unweighted: range sidelobes will sit near -13 dB, so a strong "
+            "target will mask weaker ones a few cells away. Apply a Taylor "
+            "weighting to push them down."
+        )
+    return FilterDesign(
+        spec=spec, b=np.asarray(taps), a=np.array([1.0]), notes=notes
+    )
 
 
 # --------------------------------------------------------------------------
