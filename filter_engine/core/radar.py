@@ -110,20 +110,19 @@ def blind_speed_ms(pri_s: float, carrier_hz: float, n: int = 1) -> float:
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Weighting:
-    """A weighting (taper) function and what it costs.
+    """A weighting (taper) function and what it is for.
 
-    ``pslr_db`` and ``broadening`` are the two numbers that decide a radar
-    taper: how far down the sidelobes go, and how much mainlobe -- how much
-    resolution -- you give up to get there.
+    Only the nominal sidelobe level is recorded. What a taper *costs* --
+    mainlobe broadening and SNR loss -- is measured from the realised filter
+    by :func:`filter_engine.core.analysis.radar_metrics` rather than quoted
+    from a table, because it depends on the waveform as well as the window.
     """
 
     name: str
     label: str
     #: Typical peak sidelobe ratio, dB below the mainlobe peak. ``None`` when
-    #: the window is parameterised and you choose it.
+    #: the window is parameterised and you choose the level yourself.
     pslr_db: float | None
-    #: Mainlobe width relative to an unweighted (rectangular) aperture.
-    broadening: float
     description: str
 
 
@@ -132,42 +131,42 @@ class Weighting:
 #: mainlobe width against a rectangular taper.
 WEIGHTINGS: tuple[Weighting, ...] = (
     Weighting(
-        "boxcar", "None (rectangular)", -13.3, 1.00,
+        "boxcar", "None (rectangular)", -13.3,
         "No weighting. Best resolution and no SNR loss, but -13 dB sidelobes "
         "mean a strong target hides weak ones several cells away.",
     ),
     Weighting(
-        "hann", "Hann", -31.5, 1.65,
+        "hann", "Hann", -31.5,
         "Sidelobes fall away quickly with distance, which helps against "
         "distributed clutter.",
     ),
     Weighting(
-        "hamming", "Hamming", -42.7, 1.47,
+        "hamming", "Hamming", -42.7,
         "The classic compromise: much better than Hann near the mainlobe for "
         "slightly less broadening.",
     ),
     Weighting(
-        "blackman", "Blackman", -58.1, 1.90,
+        "blackman", "Blackman", -58.1,
         "Deep sidelobes at a real cost in resolution.",
     ),
     Weighting(
-        "blackmanharris", "Blackman-Harris", -92.0, 2.24,
+        "blackmanharris", "Blackman-Harris", -92.0,
         "Very deep sidelobes; broad mainlobe.",
     ),
     Weighting(
-        "taylor", "Taylor", None, 1.0,
+        "taylor", "Taylor", None,
         "The radar standard. You name the sidelobe level and how many "
         "sidelobes sit at it, and it gets there with less mainlobe "
         "broadening than any fixed window achieving the same level.",
     ),
     Weighting(
-        "chebwin", "Dolph-Chebyshev", None, 1.0,
+        "chebwin", "Dolph-Chebyshev", None,
         "Every sidelobe at exactly the level you name -- the narrowest "
         "possible mainlobe for that level. The far sidelobes never decay, "
         "which can integrate badly against extended clutter.",
     ),
     Weighting(
-        "kaiser", "Kaiser", None, 1.0,
+        "kaiser", "Kaiser", None,
         "A close, cheaper approximation to Dolph-Chebyshev, tuned by a "
         "single beta parameter.",
     ),
