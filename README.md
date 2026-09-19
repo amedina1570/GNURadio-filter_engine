@@ -125,7 +125,10 @@ A non-zero carrier offset produces complex baseband (I/Q), which is what an
 SDR front end actually delivers; a radar echo is always I/Q.
 
 The filtered output is drawn shifted back by the filter's group delay, so
-you are looking at distortion rather than latency.
+you are looking at distortion rather than latency. For radar excitations the
+output switches to a **dB envelope** automatically — a target 40 dB below its
+neighbour is one hundredth of the height on a linear axis, which hides the
+very thing the filter exists to reveal.
 
 ### Check the fixed-point reality
 

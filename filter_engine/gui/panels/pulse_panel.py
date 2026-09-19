@@ -245,6 +245,14 @@ class PulsePanel(QtWidgets.QWidget):
         )
         self.align_check.toggled.connect(self._redraw)
         view_form.addRow("", self.align_check)
+
+        self.db_check = QtWidgets.QCheckBox("Output in dB")
+        self.db_check.setToolTip(
+            "Show the envelope logarithmically. Essential for radar: a target "
+            "40 dB below its neighbour is invisible on a linear axis."
+        )
+        self.db_check.toggled.connect(self._redraw)
+        view_form.addRow("", self.db_check)
         self.window_combo = QtWidgets.QComboBox()
         for name in ("hann", "hamming", "blackmanharris", "flattop", "boxcar"):
             self.window_combo.addItem(name, name)
@@ -298,6 +306,12 @@ class PulsePanel(QtWidgets.QWidget):
         return combo_enum(self.kind_combo, PulseKind, PulseKind.RECT)
 
     def _on_kind(self) -> None:
+        # A radar echo compresses to a spike with everything interesting
+        # 30-60 dB below it, so linear is the wrong default there.
+        if self._kind().is_radar and not self.db_check.isChecked():
+            blocked = self.db_check.blockSignals(True)
+            self.db_check.setChecked(True)
+            self.db_check.blockSignals(blocked)
         self._update_visibility()
         self._regenerate()
 
@@ -460,6 +474,7 @@ class PulsePanel(QtWidgets.QWidget):
             self._generated.x,
             self._output,
             align_delay=self._group_delay_seconds(),
+            db=self.db_check.isChecked(),
         )
 
     def _draw_spectrum(self, figure) -> None:

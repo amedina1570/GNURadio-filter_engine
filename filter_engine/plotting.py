@@ -468,12 +468,23 @@ def plot_pulse_time(
     x: np.ndarray,
     y: np.ndarray,
     align_delay: float = 0.0,
+    db: bool = False,
+    dynamic_range_db: float = 80.0,
 ) -> None:
     """Input and filtered output against time.
 
     ``align_delay`` shifts the output back by the filter's group delay so the
     two line up; without it every comparison looks like a timing error.
+
+    ``db`` switches to a logarithmic envelope view. That is not a cosmetic
+    preference for radar: a target 40 dB below its neighbour is one hundredth
+    of the height on a linear axis and simply cannot be seen, which is the
+    entire question a compression filter exists to answer.
     """
+    if db:
+        _plot_pulse_time_db(fig, t, x, y, align_delay, dynamic_range_db)
+        return
+
     div, unit = _time_scale(float(t[-1]) if t.size else 1.0)
     complex_signal = np.iscomplexobj(x) or np.iscomplexobj(y)
 
@@ -507,6 +518,51 @@ def plot_pulse_time(
     if align_delay:
         title += f"  (output shifted back {align_delay * 1e6:.3g} us to align)"
     fig.suptitle(title, fontsize=11)
+
+
+def _plot_pulse_time_db(
+    fig: Figure,
+    t: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    align_delay: float,
+    dynamic_range_db: float,
+) -> None:
+    """Envelope view in dB: the radar range profile."""
+    div, unit = _time_scale(float(t[-1]) if t.size else 1.0)
+    ax = fig.add_subplot(111)
+
+    out = np.abs(np.asarray(y))
+    peak = float(np.max(out)) if out.size else 0.0
+    if peak <= 0:
+        ax.text(0.5, 0.5, "No output", ha="center", va="center")
+        ax.set_axis_off()
+        return
+
+    inp = np.abs(np.asarray(x))
+    ax.plot(
+        t / div,
+        analysis.db20(inp / peak),
+        linewidth=0.8,
+        alpha=0.45,
+        label="input envelope",
+    )
+    ax.plot(
+        (t - align_delay) / div,
+        analysis.db20(out / peak),
+        linewidth=1.2,
+        label="output envelope",
+    )
+
+    ax.set_ylim(-dynamic_range_db, 5.0)
+    ax.set_xlabel(f"Time ({unit})")
+    ax.set_ylabel("Envelope (dB, relative to the output peak)")
+    ax.legend(loc="upper right", fontsize=8)
+    title = "Pulse response"
+    if align_delay:
+        title += f"  (output shifted back {align_delay * 1e6:.3g} us to align)"
+    ax.set_title(title, fontsize=11)
+    _grid(ax)
 
 
 def plot_pulse_spectrum(

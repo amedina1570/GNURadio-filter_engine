@@ -366,3 +366,35 @@ def test_radar_code_generation_works_from_the_gui(window):
             target = panel.target_combo.itemData(row)
             if target.supports(window._design):
                 assert "Generation failed" not in code, f"{target.label}: {code[:200]}"
+
+
+def test_radar_excitations_switch_the_output_to_db(window):
+    """A -40 dB target is one hundredth of the height on a linear axis.
+
+    Leaving a radar echo on a linear scale would hide the very thing the
+    compression filter exists to reveal, so the dB view turns itself on.
+    """
+    from filter_engine.core.signals import PulseKind
+    from filter_engine.core.spec import Response
+
+    _set_response(window, Response.MATCHED_LFM)
+    panel = window.pulse_panel
+    assert not panel.db_check.isChecked(), "linear is the default elsewhere"
+
+    def select(kind):
+        index = [
+            i
+            for i in range(panel.kind_combo.count())
+            if panel.kind_combo.itemData(i) == kind.value
+        ][0]
+        panel.kind_combo.setCurrentIndex(index)
+
+    select(PulseKind.TWO_TARGETS)
+    assert panel.db_check.isChecked()
+
+    panel.time_canvas.refresh(force=True)
+    axes = panel.time_canvas.figure.axes
+    assert axes
+    assert "dB" in axes[0].get_ylabel()
+    # The axis has to reach far enough down to show a weak target at all.
+    assert axes[0].get_ylim()[0] <= -60.0
